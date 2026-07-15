@@ -204,7 +204,10 @@ pub const Parser = struct {
             } },
             'p' => .{ .display = try .parse(self.kv) },
             'd' => .{ .delete = try .parse(self.kv) },
-            'f' => .{ .transmit_animation_frame = try .parse(self.kv) },
+            'f' => .{ .transmit_animation_frame = .{
+                .transmission = try .parse(self.kv),
+                .frame = try .parse(self.kv),
+            } },
             'a' => .{ .control_animation = try .parse(self.kv) },
             'c' => .{ .compose_animation = try .parse(self.kv) },
             else => return error.InvalidFormat,
@@ -303,6 +306,13 @@ pub const Response = struct {
     id: u32 = 0,
     image_number: u32 = 0,
     placement_id: u32 = 0,
+
+    /// The 1-based frame number an animation frame transmission resolved
+    /// to. This is only meaningful for "a=f" responses, where the frame
+    /// may have been appended or clamped and so can't be derived from the
+    /// request alone. Zero means "not an animation frame response".
+    frame_number: u32 = 0,
+
     message: []const u8 = "OK",
 
     pub fn encode(self: Response, writer: *std.Io.Writer) !void {
@@ -325,6 +335,10 @@ pub const Response = struct {
         if (self.placement_id > 0) {
             if (prior) try writer.writeByte(',') else prior = true;
             try writer.print("p={}", .{self.placement_id});
+        }
+        if (self.frame_number > 0) {
+            if (prior) try writer.writeByte(',') else prior = true;
+            try writer.print("r={}", .{self.frame_number});
         }
         try writer.writeByte(';');
         try writer.writeAll(self.message);
@@ -373,7 +387,10 @@ pub const Command = struct {
         },
         display: Display,
         delete: Delete,
-        transmit_animation_frame: AnimationFrameLoading,
+        transmit_animation_frame: struct {
+            transmission: Transmission,
+            frame: AnimationFrameLoading,
+        },
         control_animation: AnimationControl,
         compose_animation: AnimationFrameComposition,
     };
@@ -392,6 +409,7 @@ pub const Command = struct {
             .query => |t| t,
             .transmit => |t| t,
             .transmit_and_display => |t| t.transmission,
+            .transmit_animation_frame => |t| t.transmission,
             else => null,
         };
     }
@@ -648,20 +666,42 @@ pub const Display = struct {
     }
 };
 
+/// The frame-specific keys of an "a=f" (transmit animation frame) command.
+/// The regular transmission keys are parsed separately into a Transmission,
+/// since a frame transmission accepts all of them (format, medium, chunking,
+/// and so on). The two key sets are disjoint.
 pub const AnimationFrameLoading = struct {
+    /// Position of the transmitted rectangle within the frame canvas.
     x: u32 = 0, // x
     y: u32 = 0, // y
+
+    /// 1-based frame number whose data is used as the base canvas for a
+    /// newly created frame. Zero means the canvas starts as the background
+    /// color instead.
     create_frame: u32 = 0, // c
+
+    /// 1-based frame number to edit. Zero (or out of range) creates a new
+    /// frame at the end instead of editing an existing one.
     edit_frame: u32 = 0, // r
-    gap_ms: u32 = 0, // z
-    composition_mode: CompositionMode = .alpha_blend, // X
+
+    /// The gap in milliseconds. This is signed: a negative gap means the
+    /// frame is gapless (skipped during playback). Zero means "default"
+    /// for a new frame and "leave unchanged" for an edit, so the meaning
+    /// is resolved at execution time rather than here.
+    gap: i32 = 0, // z
+
+    composition_mode: CompositionMode = .alpha_blend, // X or C
     background: Background = .{}, // Y
 
+    /// The background canvas color for a new frame, as a 32-bit RGBA value
+    /// with the red channel in the MOST significant byte. Zig packs the
+    /// first field into the least significant bits, hence the reversed
+    /// field order here.
     pub const Background = packed struct(u32) {
-        r: u8 = 0,
-        g: u8 = 0,
-        b: u8 = 0,
         a: u8 = 0,
+        b: u8 = 0,
+        g: u8 = 0,
+        r: u8 = 0,
     };
 
     fn parse(kv: KV) !AnimationFrameLoading {
@@ -684,15 +724,24 @@ pub const AnimationFrameLoading = struct {
         }
 
         if (kv.get('z')) |v| {
-            result.gap_ms = v;
+            // We can bitcast here because of how we parse it earlier.
+            result.gap = @bitCast(v);
         }
 
-        if (kv.get('X')) |v| {
-            result.composition_mode = switch (v) {
-                0 => .alpha_blend,
-                1 => .overwrite,
+        // The published spec documents the composition mode as "X" but Kitty
+        // only ever reads "C" for this command, so clients exist that send
+        // either. Accept both, and let an explicit overwrite from either key
+        // win.
+        //
+        // https://sw.kovidgoyal.net/kitty/graphics-protocol/#animation-frame-loading
+        // https://github.com/kovidgoyal/kitty/blob/f47590533d7177daf0b74963f9d1b7581467af20/kitty/graphics.c#L1064
+        for ([_]u8{ 'X', 'C' }) |key| {
+            const v = kv.get(key) orelse continue;
+            switch (v) {
+                0 => {},
+                1 => result.composition_mode = .overwrite,
                 else => return error.InvalidFormat,
-            };
+            }
         }
 
         if (kv.get('Y')) |v| {
@@ -703,15 +752,33 @@ pub const AnimationFrameLoading = struct {
     }
 };
 
+/// The keys of an "a=c" (compose animation frames) command.
+///
+/// Note that the field names here do not mean what they look like they mean.
+/// The spec's prose has the source and destination backwards; Kitty's
+/// implementation and the spec's own worked example agree on the mapping
+/// documented per-field below, and that is what clients rely on.
+///
+/// https://github.com/kovidgoyal/kitty/blob/f47590533d7177daf0b74963f9d1b7581467af20/kitty/graphics.c#L1141
 pub const AnimationFrameComposition = struct {
+    /// The DESTINATION frame, composed onto (1-based), despite the name.
     frame: u32 = 0, // c
+
+    /// The SOURCE frame, read from (1-based), despite the name.
     edit_frame: u32 = 0, // r
+
+    /// Offset of the rectangle within the DESTINATION frame.
     x: u32 = 0, // x
     y: u32 = 0, // y
+
+    /// Size of the composed rectangle. Zero means the full image size.
     width: u32 = 0, // w
     height: u32 = 0, // h
+
+    /// Offset of the rectangle within the SOURCE frame, despite the names.
     left_edge: u32 = 0, // X
     top_edge: u32 = 0, // Y
+
     composition_mode: CompositionMode = .alpha_blend, // C
 
     fn parse(kv: KV) !AnimationFrameComposition {
@@ -763,9 +830,20 @@ pub const AnimationFrameComposition = struct {
 
 pub const AnimationControl = struct {
     action: AnimationAction = .invalid, // s
+
+    /// The 1-based frame whose gap to set. Zero means no gap change. This
+    /// is the only way to set a gap on the root frame.
     frame: u32 = 0, // r
-    gap_ms: u32 = 0, // z
+
+    /// The gap in milliseconds for the frame named by `frame`. Signed: a
+    /// negative gap means gapless. Zero means "leave unchanged".
+    gap: i32 = 0, // z
+
+    /// The 1-based frame to make current. Zero means no change.
     current_frame: u32 = 0, // c
+
+    /// The number of loops to play, where 1 means loop forever and n>1
+    /// means n-1 loops. Zero means "leave unchanged".
     loops: u32 = 0, // v
 
     pub const AnimationAction = enum {
@@ -793,7 +871,8 @@ pub const AnimationControl = struct {
         }
 
         if (kv.get('z')) |v| {
-            result.gap_ms = v;
+            // We can bitcast here because of how we parse it earlier.
+            result.gap = @bitCast(v);
         }
 
         if (kv.get('c')) |v| {
@@ -830,7 +909,12 @@ pub const Delete = union(enum) {
     intersect_cursor: bool,
 
     // f/F
-    animation_frames: bool,
+    animation_frames: struct {
+        delete: bool = false, // uppercase
+        image_id: u32 = 0, // i
+        image_number: u32 = 0, // I
+        frame: u32 = 0, // r
+    },
 
     // p/P
     intersect_cell: struct {
@@ -908,7 +992,20 @@ pub const Delete = union(enum) {
 
             'c', 'C' => .{ .intersect_cursor = what == 'C' },
 
-            'f', 'F' => .{ .animation_frames = what == 'F' },
+            'f', 'F' => blk: {
+                var result: Delete = .{ .animation_frames = .{ .delete = what == 'F' } };
+                if (kv.get('i')) |v| {
+                    result.animation_frames.image_id = v;
+                }
+                if (kv.get('I')) |v| {
+                    result.animation_frames.image_number = v;
+                }
+                if (kv.get('r')) |v| {
+                    result.animation_frames.frame = v;
+                }
+
+                break :blk result;
+            },
 
             'p', 'P' => blk: {
                 var result: Delete = .{ .intersect_cell = .{ .delete = what == 'P' } };
@@ -1401,4 +1498,222 @@ test "delete range command 5" {
     const input = "a=d,d=R,y=5";
     for (input) |c| try p.feed(c);
     try testing.expectError(error.InvalidFormat, p.complete(alloc));
+}
+
+test "animation frame command" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A frame transmission carries both transmission and frame keys.
+    const command = try Parser.parseString(
+        alloc,
+        "a=f,i=1,f=24,t=d,s=3,v=4,x=1,y=2,c=1,r=2,z=100,m=1",
+    );
+    defer command.deinit(alloc);
+
+    try testing.expect(command.control == .transmit_animation_frame);
+    const t = command.control.transmit_animation_frame.transmission;
+    try testing.expectEqual(Transmission.Format.rgb, t.format);
+    try testing.expectEqual(Transmission.Medium.direct, t.medium);
+    try testing.expectEqual(@as(u32, 1), t.image_id);
+    try testing.expectEqual(@as(u32, 3), t.width);
+    try testing.expectEqual(@as(u32, 4), t.height);
+    try testing.expect(t.more_chunks);
+
+    // The transmission is also reachable generically, which is what the
+    // shared image loading path uses.
+    try testing.expectEqual(@as(u32, 1), command.transmission().?.image_id);
+
+    const v = command.control.transmit_animation_frame.frame;
+    try testing.expectEqual(@as(u32, 1), v.x);
+    try testing.expectEqual(@as(u32, 2), v.y);
+    try testing.expectEqual(@as(u32, 1), v.create_frame);
+    try testing.expectEqual(@as(u32, 2), v.edit_frame);
+    try testing.expectEqual(@as(i32, 100), v.gap);
+    try testing.expectEqual(CompositionMode.alpha_blend, v.composition_mode);
+}
+
+test "animation frame command: continuation chunk" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Continuation chunks repeat "a=f" but carry no other metadata.
+    const command = try Parser.parseString(alloc, "a=f,m=0");
+    defer command.deinit(alloc);
+
+    try testing.expect(command.control == .transmit_animation_frame);
+    try testing.expect(!command.control.transmit_animation_frame.transmission.more_chunks);
+}
+
+test "animation frame command: gap sign" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A negative gap means gapless and must not wrap around.
+    {
+        const command = try Parser.parseString(alloc, "a=f,i=1,z=-1");
+        defer command.deinit(alloc);
+        try testing.expectEqual(
+            @as(i32, -1),
+            command.control.transmit_animation_frame.frame.gap,
+        );
+    }
+
+    // Absent gap is zero, which means "default" for a new frame.
+    {
+        const command = try Parser.parseString(alloc, "a=f,i=1");
+        defer command.deinit(alloc);
+        try testing.expectEqual(
+            @as(i32, 0),
+            command.control.transmit_animation_frame.frame.gap,
+        );
+    }
+}
+
+test "animation frame command: composition mode" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // The spec documents "X" but Kitty reads "C", so both must work.
+    for ([_][]const u8{ "a=f,i=1,X=1", "a=f,i=1,C=1" }) |input| {
+        const command = try Parser.parseString(alloc, input);
+        defer command.deinit(alloc);
+        try testing.expectEqual(
+            CompositionMode.overwrite,
+            command.control.transmit_animation_frame.frame.composition_mode,
+        );
+    }
+
+    for ([_][]const u8{ "a=f,i=1,X=0", "a=f,i=1,C=0" }) |input| {
+        const command = try Parser.parseString(alloc, input);
+        defer command.deinit(alloc);
+        try testing.expectEqual(
+            CompositionMode.alpha_blend,
+            command.control.transmit_animation_frame.frame.composition_mode,
+        );
+    }
+
+    // An explicit overwrite from either key wins.
+    {
+        const command = try Parser.parseString(alloc, "a=f,i=1,X=0,C=1");
+        defer command.deinit(alloc);
+        try testing.expectEqual(
+            CompositionMode.overwrite,
+            command.control.transmit_animation_frame.frame.composition_mode,
+        );
+    }
+
+    for ([_][]const u8{ "a=f,i=1,X=2", "a=f,i=1,C=2" }) |input| {
+        try testing.expectError(
+            error.InvalidFormat,
+            Parser.parseString(alloc, input),
+        );
+    }
+}
+
+test "animation frame command: background byte order" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Red is the most significant byte: 0xFF0000FF is opaque red.
+    {
+        const command = try Parser.parseString(alloc, "a=f,i=1,Y=4278190335");
+        defer command.deinit(alloc);
+        const bg = command.control.transmit_animation_frame.frame.background;
+        try testing.expectEqual(@as(u8, 255), bg.r);
+        try testing.expectEqual(@as(u8, 0), bg.g);
+        try testing.expectEqual(@as(u8, 0), bg.b);
+        try testing.expectEqual(@as(u8, 255), bg.a);
+    }
+
+    // 0x00FF0088 is green with alpha 136.
+    {
+        const command = try Parser.parseString(alloc, "a=f,i=1,Y=16711816");
+        defer command.deinit(alloc);
+        const bg = command.control.transmit_animation_frame.frame.background;
+        try testing.expectEqual(@as(u8, 0), bg.r);
+        try testing.expectEqual(@as(u8, 255), bg.g);
+        try testing.expectEqual(@as(u8, 0), bg.b);
+        try testing.expectEqual(@as(u8, 136), bg.a);
+    }
+}
+
+test "animation control command" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const command = try Parser.parseString(alloc, "a=a,i=1,s=3,r=2,z=-5,c=3,v=5");
+    defer command.deinit(alloc);
+
+    try testing.expect(command.control == .control_animation);
+    const v = command.control.control_animation;
+    try testing.expectEqual(AnimationControl.AnimationAction.run, v.action);
+    try testing.expectEqual(@as(u32, 2), v.frame);
+    try testing.expectEqual(@as(i32, -5), v.gap);
+    try testing.expectEqual(@as(u32, 3), v.current_frame);
+    try testing.expectEqual(@as(u32, 5), v.loops);
+}
+
+test "animation compose command" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const command = try Parser.parseString(
+        alloc,
+        "a=c,i=1,r=2,c=3,w=4,h=5,X=6,Y=7,x=8,y=9,C=1",
+    );
+    defer command.deinit(alloc);
+
+    try testing.expect(command.control == .compose_animation);
+    const v = command.control.compose_animation;
+
+    // Note the naming trap: "r" is the source and "c" is the destination.
+    try testing.expectEqual(@as(u32, 2), v.edit_frame);
+    try testing.expectEqual(@as(u32, 3), v.frame);
+    try testing.expectEqual(@as(u32, 4), v.width);
+    try testing.expectEqual(@as(u32, 5), v.height);
+    try testing.expectEqual(@as(u32, 6), v.left_edge);
+    try testing.expectEqual(@as(u32, 7), v.top_edge);
+    try testing.expectEqual(@as(u32, 8), v.x);
+    try testing.expectEqual(@as(u32, 9), v.y);
+    try testing.expectEqual(CompositionMode.overwrite, v.composition_mode);
+}
+
+test "delete animation frames command" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    {
+        const command = try Parser.parseString(alloc, "a=d,d=f,i=3,r=2");
+        defer command.deinit(alloc);
+
+        try testing.expect(command.control.delete == .animation_frames);
+        const v = command.control.delete.animation_frames;
+        try testing.expect(!v.delete);
+        try testing.expectEqual(@as(u32, 3), v.image_id);
+        try testing.expectEqual(@as(u32, 0), v.image_number);
+        try testing.expectEqual(@as(u32, 2), v.frame);
+    }
+
+    {
+        const command = try Parser.parseString(alloc, "a=d,d=F,I=7");
+        defer command.deinit(alloc);
+
+        try testing.expect(command.control.delete == .animation_frames);
+        const v = command.control.delete.animation_frames;
+        try testing.expect(v.delete);
+        try testing.expectEqual(@as(u32, 0), v.image_id);
+        try testing.expectEqual(@as(u32, 7), v.image_number);
+        try testing.expectEqual(@as(u32, 0), v.frame);
+    }
+}
+
+test "response: encode with frame number" {
+    const testing = std.testing;
+    var buf: [1024]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+
+    var r: Response = .{ .id = 3, .frame_number = 2 };
+    try r.encode(&writer);
+    try testing.expectEqualStrings("\x1b_Gi=3,r=2;OK\x1b\\", writer.buffered());
 }
