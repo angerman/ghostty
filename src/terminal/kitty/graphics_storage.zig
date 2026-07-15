@@ -420,6 +420,111 @@ pub const ImageStorage = struct {
         return .{ .found = self.images.getPtr(id) orelse return .not_found };
     }
 
+    /// The outcome of an animation tick.
+    pub const TickResult = struct {
+        /// True if any image's visible pixels changed, meaning the
+        /// renderer has to re-upload and redraw.
+        dirtied: bool = false,
+
+        /// When the next frame is due, on the same clock as the tick's
+        /// now_ms, or null if nothing is waiting to be shown. Callers must
+        /// use this even when nothing was dirtied, or an animation that
+        /// isn't due yet would never be looked at again.
+        next_due_ms: ?u64 = null,
+    };
+
+    /// True if this image's animation could show a new frame at some
+    /// point. This is Kitty's animatable check, and the reasons to say no
+    /// are all cheap to test.
+    fn animatable(self: *const ImageStorage, img: *const Image) bool {
+        const anim = img.anim orelse return false;
+        if (anim.state == .stopped) return false;
+
+        // Nothing to advance through.
+        if (anim.frames.items.len == 0) return false;
+
+        // Every frame is gapless, so there is no frame to stop on. This
+        // also guards advance() against spinning forever.
+        if (anim.nonzero_gap_count == 0) return false;
+
+        // The animation has played out its loops.
+        if (anim.max_loops != 0 and anim.current_loop >= anim.max_loops) return false;
+
+        // Kitty tracks whether an image is actually drawn; we approximate
+        // that with "has any placement at all". An image whose only
+        // placement has scrolled off into the scrollback therefore keeps
+        // ticking. See the v1 notes in graphics.zig.
+        var it = self.placements.iterator();
+        while (it.next()) |kv| {
+            if (kv.key_ptr.image_id == img.id) return true;
+        }
+
+        return false;
+    }
+
+    /// Advance any animations that are due, and report when the next one
+    /// is. This is Kitty's scan_active_animations.
+    ///
+    /// Note that this mutates terminal state, so the renderer may only
+    /// call it while holding the state mutex.
+    pub fn animationTick(self: *ImageStorage, now_ms: u64) TickResult {
+        var result: TickResult = .{};
+
+        // The overwhelmingly common case: nothing here animates.
+        if (self.animation_count == 0) return result;
+
+        var it = self.images.iterator();
+        while (it.next()) |kv| {
+            const img = kv.value_ptr;
+            if (!self.animatable(img)) continue;
+            const anim = img.anim.?;
+
+            var next_at = anim.last_frame_ms +| anim.gapOf(anim.current_frame);
+            if (now_ms >= next_at) {
+                // Only ever advance one frame per tick: Kitty doesn't try
+                // to catch up on missed frames either, it just lets the
+                // timing drift under load.
+                if (!anim.advance()) continue;
+
+                anim.last_frame_ms = now_ms;
+                self.markMutated();
+                img.generation = self.generation;
+                result.dirtied = true;
+
+                next_at = now_ms +| anim.gapOf(anim.current_frame);
+            }
+
+            if (next_at > now_ms) {
+                result.next_due_ms = @min(result.next_due_ms orelse next_at, next_at);
+            }
+        }
+
+        return result;
+    }
+
+    /// When the next animation frame is due, without advancing anything.
+    /// The renderer uses this to arm its timer.
+    ///
+    /// The deadline is absolute, on the same clock as animationNowMs, and
+    /// may be in the past if an animation is already overdue; the caller
+    /// clamps it against its own idea of now.
+    pub fn nextAnimationDeadline(self: *const ImageStorage) ?u64 {
+        if (self.animation_count == 0) return null;
+
+        var next: ?u64 = null;
+        var it = self.images.iterator();
+        while (it.next()) |kv| {
+            const img = kv.value_ptr;
+            if (!self.animatable(img)) continue;
+            const anim = img.anim.?;
+
+            const due = anim.last_frame_ms +| anim.gapOf(anim.current_frame);
+            next = @min(next orelse due, due);
+        }
+
+        return next;
+    }
+
     /// Errors from the animation frame operations below. graphics_exec.zig
     /// maps these onto the protocol's error responses.
     pub const AnimationError = error{
@@ -2997,4 +3102,301 @@ test "storage: delete animation frame clamps" {
     _ = s.deleteAnimationFrame(alloc, &t, .{ .image_id = 1, .frame = 0 }, 0);
     try testing.expectEqual(@as(u8, 2), img.renderData()[0]);
     try testing.expectEqual(@as(usize, 0), img.anim.?.frames.items.len);
+}
+
+/// An animated image with a placement, ready to tick: a root plus `extra`
+/// frames, each with a 100ms gap, running.
+fn testAddPlayableImage(
+    s: *ImageStorage,
+    alloc: Allocator,
+    t: *terminal.Terminal,
+    id: u32,
+    extra: u8,
+) !void {
+    try testAddAnimatedImage(s, alloc, id, extra);
+    try s.addPlacement(alloc, id, 0, .{
+        .location = .{ .pin = try trackPin(t, .{ .x = 0, .y = 0 }) },
+    });
+
+    const anim = s.images.getPtr(id).?.anim.?;
+    anim.state = .running;
+    anim.setGap(0, 100);
+    for (0..anim.frames.items.len) |i| anim.setGap(@intCast(i + 1), 100);
+}
+
+test "storage: animation tick advances on schedule" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddPlayableImage(&s, alloc, &t, 1, 1);
+
+    const img = s.images.getPtr(1).?;
+
+    // Nothing is due yet, but the deadline is reported so the caller can
+    // arm a timer for it.
+    {
+        const r = s.animationTick(50);
+        try testing.expect(!r.dirtied);
+        try testing.expectEqual(@as(?u64, 100), r.next_due_ms);
+        try testing.expectEqual(@as(?u64, 100), s.nextAnimationDeadline());
+        try testing.expectEqual(@as(u32, 0), img.anim.?.current_frame);
+    }
+
+    // At the deadline the frame advances, and the next one is due a gap
+    // later.
+    {
+        const gen_before = img.generation;
+        const r = s.animationTick(100);
+        try testing.expect(r.dirtied);
+        try testing.expectEqual(@as(?u64, 200), r.next_due_ms);
+        try testing.expectEqual(@as(u32, 1), img.anim.?.current_frame);
+        try testing.expectEqual(@as(u8, 2), img.renderData()[0]);
+        try testing.expect(img.generation != gen_before);
+    }
+
+    // Only one frame per tick: Kitty doesn't catch up on missed frames
+    // either, so a very late tick still advances just once.
+    {
+        const r = s.animationTick(10_000);
+        try testing.expect(r.dirtied);
+        try testing.expectEqual(@as(u32, 0), img.anim.?.current_frame);
+        try testing.expectEqual(@as(?u64, 10_100), r.next_due_ms);
+    }
+}
+
+test "storage: animation tick is dormant without a placement" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    // Same as a playable image but with no placement.
+    try testAddAnimatedImage(&s, alloc, 1, 1);
+    const anim = s.images.getPtr(1).?.anim.?;
+    anim.state = .running;
+    anim.setGap(0, 100);
+
+    const r = s.animationTick(10_000);
+    try testing.expect(!r.dirtied);
+    try testing.expectEqual(@as(?u64, null), r.next_due_ms);
+    try testing.expectEqual(@as(?u64, null), s.nextAnimationDeadline());
+}
+
+test "storage: animation tick is dormant when stopped or gapless" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddPlayableImage(&s, alloc, &t, 1, 1);
+    const anim = s.images.getPtr(1).?.anim.?;
+
+    // Stopped freezes on the current frame.
+    anim.state = .stopped;
+    try testing.expectEqual(@as(?u64, null), s.nextAnimationDeadline());
+    try testing.expect(!s.animationTick(10_000).dirtied);
+    try testing.expectEqual(@as(u32, 0), anim.current_frame);
+
+    // An animation where every frame is gapless has no frame to stop on,
+    // and must not be ticked at all: advance() would spin forever.
+    anim.state = .running;
+    anim.setGap(0, 0);
+    anim.setGap(1, 0);
+    try testing.expectEqual(@as(u32, 0), anim.nonzero_gap_count);
+    try testing.expectEqual(@as(?u64, null), s.nextAnimationDeadline());
+    try testing.expect(!s.animationTick(10_000).dirtied);
+}
+
+test "storage: animation tick with no animations early-outs" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddImage(&s, alloc, 1, 1, 1, .rgba, 1);
+
+    try testing.expectEqual(@as(usize, 0), s.animation_count);
+    try testing.expectEqual(@as(?u64, null), s.nextAnimationDeadline());
+    try testing.expect(!s.animationTick(0).dirtied);
+}
+
+test "storage: animation tick skips gapless frames" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddPlayableImage(&s, alloc, &t, 1, 2);
+
+    // Make frame 2 gapless: it must be skipped straight over rather than
+    // ever being displayed.
+    const img = s.images.getPtr(1).?;
+    img.anim.?.setGap(1, 0);
+
+    const r = s.animationTick(100);
+    try testing.expect(r.dirtied);
+    try testing.expectEqual(@as(u32, 2), img.anim.?.current_frame);
+    try testing.expectEqual(@as(u8, 3), img.renderData()[0]);
+    try testing.expectEqual(@as(?u64, 200), r.next_due_ms);
+}
+
+test "storage: animation tick loop counting" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    // v=2 means max_loops=1: one pass that ends on the last frame.
+    {
+        var s: ImageStorage = .{};
+        defer s.deinit(alloc, t.screens.active);
+        try testAddPlayableImage(&s, alloc, &t, 1, 1);
+        const anim = s.images.getPtr(1).?.anim.?;
+        anim.max_loops = 1;
+
+        // Root -> frame 2.
+        try testing.expect(s.animationTick(100).dirtied);
+        try testing.expectEqual(@as(u32, 1), anim.current_frame);
+
+        // The wrap is counted but not committed, so the last frame stays
+        // up and the animation goes quiet.
+        const r = s.animationTick(200);
+        try testing.expect(!r.dirtied);
+        try testing.expectEqual(@as(?u64, null), r.next_due_ms);
+        try testing.expectEqual(@as(u32, 1), anim.current_frame);
+        try testing.expectEqual(@as(u32, 1), anim.current_loop);
+        try testing.expectEqual(@as(?u64, null), s.nextAnimationDeadline());
+    }
+
+    // v=3 means max_loops=2: two full passes.
+    {
+        var s: ImageStorage = .{};
+        defer s.deinit(alloc, t.screens.active);
+        try testAddPlayableImage(&s, alloc, &t, 1, 1);
+        const anim = s.images.getPtr(1).?.anim.?;
+        anim.max_loops = 2;
+
+        try testing.expect(s.animationTick(100).dirtied); // -> frame 2
+        try testing.expect(s.animationTick(200).dirtied); // -> root, loop 1
+        try testing.expectEqual(@as(u32, 0), anim.current_frame);
+        try testing.expectEqual(@as(u32, 1), anim.current_loop);
+
+        try testing.expect(s.animationTick(300).dirtied); // -> frame 2
+        try testing.expect(!s.animationTick(400).dirtied); // done
+        try testing.expectEqual(@as(u32, 1), anim.current_frame);
+        try testing.expectEqual(@as(u32, 2), anim.current_loop);
+    }
+
+    // v=1 means max_loops=0, which is forever.
+    {
+        var s: ImageStorage = .{};
+        defer s.deinit(alloc, t.screens.active);
+        try testAddPlayableImage(&s, alloc, &t, 1, 1);
+        const anim = s.images.getPtr(1).?.anim.?;
+
+        var now: u64 = 100;
+        for (0..10) |_| {
+            try testing.expect(s.animationTick(now).dirtied);
+            now += 100;
+        }
+        try testing.expect(anim.current_loop > 1);
+        try testing.expect(s.nextAnimationDeadline() != null);
+    }
+}
+
+test "storage: animation tick waits at the tail while loading" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddPlayableImage(&s, alloc, &t, 1, 1);
+
+    const img = s.images.getPtr(1).?;
+    img.anim.?.state = .loading;
+
+    // Root -> frame 2, then wait at the tail rather than looping. Nothing
+    // is scheduled, so no timer spins while we wait.
+    try testing.expect(s.animationTick(100).dirtied);
+    const r = s.animationTick(200);
+    try testing.expect(!r.dirtied);
+    try testing.expectEqual(@as(?u64, null), r.next_due_ms);
+    try testing.expectEqual(@as(u32, 1), img.anim.?.current_frame);
+    try testing.expectEqual(@as(u32, 0), img.anim.?.current_loop);
+
+    // A new frame arriving resumes playback.
+    const src: [4]u8 = @splat(9);
+    _ = try s.addAnimationFrame(
+        alloc,
+        1,
+        .{ .composition_mode = .overwrite },
+        &src,
+        .rgba,
+        1,
+        1,
+        200,
+    );
+    try testing.expect(s.animationTick(300).dirtied);
+    try testing.expectEqual(@as(u32, 2), img.anim.?.current_frame);
+    try testing.expectEqual(@as(u8, 9), img.renderData()[0]);
+}
+
+test "storage: animation deadline saturates" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddPlayableImage(&s, alloc, &t, 1, 1);
+
+    // A timestamp near the end of the clock must not wrap around into a
+    // deadline in the distant past.
+    const anim = s.images.getPtr(1).?.anim.?;
+    anim.last_frame_ms = std.math.maxInt(u64) - 1;
+    try testing.expectEqual(
+        @as(?u64, std.math.maxInt(u64)),
+        s.nextAnimationDeadline(),
+    );
+}
+
+test "storage: animation deadline picks the earliest" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddPlayableImage(&s, alloc, &t, 1, 1);
+    try testAddPlayableImage(&s, alloc, &t, 2, 1);
+
+    // Two animations with different gaps: the timer must be armed for
+    // whichever comes first.
+    s.images.getPtr(1).?.anim.?.setGap(0, 500);
+    s.images.getPtr(2).?.anim.?.setGap(0, 250);
+    try testing.expectEqual(@as(?u64, 250), s.nextAnimationDeadline());
+
+    // Ticking at that deadline advances only the one that's due.
+    const r = s.animationTick(250);
+    try testing.expect(r.dirtied);
+    try testing.expectEqual(@as(u32, 0), s.images.getPtr(1).?.anim.?.current_frame);
+    try testing.expectEqual(@as(u32, 1), s.images.getPtr(2).?.anim.?.current_frame);
+    try testing.expectEqual(@as(?u64, 350), r.next_due_ms);
 }
