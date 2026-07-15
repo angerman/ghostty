@@ -6,7 +6,23 @@
 //! Unimplemented features that are still todo:
 //! - shared memory transmit
 //! - virtual placement w/ unicode
-//! - animation
+//!
+//! Animation:
+//! Animation is implemented, but stores frames differently from Kitty.
+//! Every frame is a fully-composed, full-canvas RGBA buffer, where Kitty
+//! keeps partial frames that reference a base frame and coalesces them on
+//! demand. Kitty can afford that because it also has a disk cache to spill
+//! frames to; we don't, so we trade the memory for a much simpler
+//! implementation. For the same reason frames are charged against the same
+//! per-screen RAM quota as images rather than Kitty's separate 5x disk
+//! quota, and a large animation is more likely to evict images here than
+//! it would there.
+//!
+//! Playback advances from the renderer thread, which is the only thread
+//! that progresses without client input. An animation is considered
+//! playable if it has any placement at all, which only approximates
+//! Kitty's renderer-tracked "is drawn": an image whose sole placement has
+//! scrolled into the scrollback keeps ticking.
 //!
 //! Performance:
 //! The performance of this particular subsystem of Ghostty is not great.

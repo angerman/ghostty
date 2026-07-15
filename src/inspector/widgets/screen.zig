@@ -319,6 +319,12 @@ pub fn kittyGraphicsTable(
 
     cimgui.c.ImGui_TableNextRow();
     _ = cimgui.c.ImGui_TableSetColumnIndex(0);
+    cimgui.c.ImGui_Text("Animated Images");
+    _ = cimgui.c.ImGui_TableSetColumnIndex(1);
+    cimgui.c.ImGui_Text("%d", kitty_images.animation_count);
+
+    cimgui.c.ImGui_TableNextRow();
+    _ = cimgui.c.ImGui_TableSetColumnIndex(0);
     cimgui.c.ImGui_Text("Placement Count");
     _ = cimgui.c.ImGui_TableSetColumnIndex(1);
     cimgui.c.ImGui_Text("%d", kitty_images.placements.count());
