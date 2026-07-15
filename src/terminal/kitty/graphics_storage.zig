@@ -218,7 +218,11 @@ pub const ImageStorage = struct {
     /// screen switches); those must set only the dirty flag directly.
     /// Bumping the generation for geometry changes would break the
     /// contract that an unchanged generation means unchanged contents.
-    fn markMutated(self: *ImageStorage) void {
+    ///
+    /// Nor for animation changes that only affect *when* a frame is shown
+    /// (gaps, playback state, loop counts): those set dirty directly so
+    /// the renderer reschedules without re-uploading an identical texture.
+    pub fn markMutated(self: *ImageStorage) void {
         self.dirty = true;
         self.generation = nextGeneration();
     }
@@ -378,6 +382,42 @@ pub const ImageStorage = struct {
     /// animation timestamp shares a single clock domain.
     pub fn animationNowMs(self: *ImageStorage) ?u64 {
         return self.animation_clock.nowMs();
+    }
+
+    /// How an animation command's "i"/"I" identifiers resolved. Every
+    /// animation action identifies its image the same way, but they don't
+    /// all report a failure the same way, so this reports what happened
+    /// and lets the caller decide.
+    pub const ResolvedImage = union(enum) {
+        /// The image exists. Mutation must go through this pointer, never
+        /// through an Image copied out of the map by value.
+        found: *Image,
+
+        /// Both "i" and "I" were given, which is invalid.
+        conflict,
+
+        /// Neither "i" nor "I" was given.
+        no_identifier,
+
+        /// An identifier was given but names no image.
+        not_found,
+    };
+
+    /// Resolve the image an animation command names.
+    pub fn resolveAnimationImagePtr(
+        self: *ImageStorage,
+        image_id: u32,
+        image_number: u32,
+    ) ResolvedImage {
+        if (image_id > 0 and image_number > 0) return .conflict;
+        if (image_id == 0 and image_number == 0) return .no_identifier;
+
+        const id = if (image_id > 0) image_id else id: {
+            const img = self.imageByNumber(image_number) orelse return .not_found;
+            break :id img.id;
+        };
+
+        return .{ .found = self.images.getPtr(id) orelse return .not_found };
     }
 
     /// Errors from the animation frame operations below. graphics_exec.zig
@@ -836,24 +876,24 @@ pub const ImageStorage = struct {
         v: @FieldType(command.Delete, "animation_frames"),
         now_ms: u64,
     ) FrameDeleteResult {
-        if (v.image_id > 0 and v.image_number > 0) return .invalid_identifiers;
-        if (v.image_id == 0 and v.image_number == 0) {
-            log.warn("delete animation frame requires an image id or number", .{});
-            return .no_op_or_missing;
-        }
-
-        const image_id = if (v.image_id > 0) v.image_id else id: {
-            const img = self.imageByNumber(v.image_number) orelse {
-                log.warn("delete animation frame: no image number={}", .{v.image_number});
+        // Unlike the other animation actions, a delete that names no
+        // image only logs: it never sends a response.
+        const img = switch (self.resolveAnimationImagePtr(v.image_id, v.image_number)) {
+            .found => |img| img,
+            .conflict => return .invalid_identifiers,
+            .no_identifier => {
+                log.warn("delete animation frame requires an image id or number", .{});
                 return .no_op_or_missing;
-            };
-            break :id img.id;
+            },
+            .not_found => {
+                log.warn("delete animation frame: no image id={} number={}", .{
+                    v.image_id,
+                    v.image_number,
+                });
+                return .no_op_or_missing;
+            },
         };
-
-        const img = self.images.getPtr(image_id) orelse {
-            log.warn("delete animation frame: no image id={}", .{image_id});
-            return .no_op_or_missing;
-        };
+        const image_id = img.id;
 
         // With no frames to delete, the uppercase form deletes the whole
         // image and the lowercase form does nothing.

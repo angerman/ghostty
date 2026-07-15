@@ -41,9 +41,28 @@ pub const LoadingImage = struct {
     /// so that we display the image after it is fully loaded.
     display: ?command.Display = null,
 
+    /// Non-null when this is an animation frame transmission ("a=f")
+    /// rather than an image transmission, in which case the loaded pixels
+    /// are composed into an existing image instead of becoming one.
+    ///
+    /// The protocol requires "a=f" on every chunk of a frame, but a
+    /// continuation carries only "m", so the target and the frame
+    /// parameters have to be remembered from the initial chunk here.
+    frame: ?Frame = null,
+
     /// Quiet is the quiet settings for the initial load command. This is
     /// used if q isn't set on subsequent chunks.
     quiet: command.Command.Quiet,
+
+    pub const Frame = struct {
+        /// The image the frame belongs to, resolved from "i"/"I" on the
+        /// initial chunk. Resolving once means a chunked frame can't be
+        /// redirected by a number lookup changing mid-transmission.
+        target_image_id: u32,
+
+        /// The frame parameters from the initial chunk.
+        params: command.AnimationFrameLoading,
+    };
 
     /// The limits of the Kitty Graphics protocol we should allow.
     ///
@@ -410,6 +429,41 @@ pub const LoadingImage = struct {
         return result;
     }
 
+    /// Complete an animation frame load, leaving the decoded rectangle in
+    /// self.data for the caller to compose.
+    ///
+    /// Unlike complete(), this produces no Image: the pixels belong to a
+    /// frame of an image that already exists. The dimensions describe the
+    /// transmitted rectangle rather than a whole image, and the data only
+    /// has to be *at least* big enough. Kitty ignores any surplus, so we
+    /// consume only the prefix we need.
+    pub fn completeFrame(self: *LoadingImage, alloc: Allocator) !void {
+        const img = &self.image;
+
+        // Decompress the data if it is compressed.
+        try self.decompress(alloc);
+
+        // Decode the png if we have to. This also supplies the rectangle
+        // dimensions, overriding whatever s/v claimed.
+        if (img.format == .png) try self.decodePng(alloc);
+
+        // Validate our dimensions.
+        if (img.width == 0 or img.height == 0) return error.DimensionsRequired;
+        if (img.width > max_dimension or img.height > max_dimension) return error.DimensionsTooLarge;
+
+        const bpp = command.Transmission.formatBpp(img.format);
+        const expected_len = img.width * img.height * bpp;
+        if (self.data.items.len < expected_len) {
+            log.warn(
+                "insufficient frame data id={} width={} height={} bpp={} expected_len={} actual_len={}",
+                .{ img.id, img.width, img.height, bpp, expected_len, self.data.items.len },
+            );
+            return error.InsufficientData;
+        }
+
+        self.data.items.len = expected_len;
+    }
+
     /// Debug function to write the data to a file. This is useful for
     /// capturing some test data for unit tests.
     pub fn debugDump(self: LoadingImage) !void {
@@ -541,6 +595,10 @@ pub const Image = struct {
 
     pub const Error = error{
         InvalidData,
+        /// An animation frame's payload was smaller than its dimensions
+        /// require. Only frames are checked this way; a whole image must
+        /// match its dimensions exactly.
+        InsufficientData,
         DecompressionFailed,
         DimensionsRequired,
         DimensionsTooLarge,

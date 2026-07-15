@@ -3,6 +3,7 @@ const assert = @import("../../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 
 const Terminal = @import("../Terminal.zig");
+const kitty_animation = @import("graphics_animation.zig");
 const command = @import("graphics_command.zig");
 const image = @import("graphics_image.zig");
 const Command = command.Command;
@@ -47,8 +48,13 @@ pub fn execute(
         .query => query(alloc, terminal, cmd),
         .display => display(alloc, terminal, cmd),
         .delete => delete(alloc, terminal, cmd),
+        .control_animation => controlAnimation(alloc, terminal, cmd),
+        .compose_animation => composeAnimation(alloc, terminal, cmd),
 
-        .transmit, .transmit_and_display => resp: {
+        .transmit,
+        .transmit_and_display,
+        .transmit_animation_frame,
+        => resp: {
             // If we're transmitting, then our `q` setting value is complicated.
             // The `q` setting inherits the value from the starting command
             // unless `q` is set >= 1 on this command. If it is, then we save
@@ -65,13 +71,11 @@ pub fn execute(
                 },
             };
 
-            break :resp transmit(alloc, terminal, cmd);
+            break :resp switch (cmd.control) {
+                .transmit_animation_frame => transmitAnimationFrame(alloc, terminal, cmd),
+                else => transmit(alloc, terminal, cmd),
+            };
         },
-
-        .transmit_animation_frame,
-        .control_animation,
-        .compose_animation,
-        => .{ .message = "ERROR: unimplemented action" },
     };
 
     // Handle the quiet settings
@@ -135,6 +139,16 @@ fn transmit(
     terminal: *Terminal,
     cmd: *const Command,
 ) Response {
+    const storage = &terminal.screens.active.kitty_images;
+
+    // The protocol requires "a=f" on every chunk of an animation frame,
+    // but Ghostty also accepts a final chunk with no action at all, which
+    // parses as a plain transmit. If a frame load is in progress, such a
+    // chunk belongs to it.
+    if (storage.loading) |loading| {
+        if (loading.frame != null) return transmitAnimationFrame(alloc, terminal, cmd);
+    }
+
     const t = cmd.transmission().?;
     var result: Response = .{
         .id = t.image_id,
@@ -291,10 +305,307 @@ fn delete(
     cmd: *const Command,
 ) Response {
     const storage = &terminal.screens.active.kitty_images;
-    storage.delete(alloc, terminal, cmd.control.delete);
+
+    switch (cmd.control.delete) {
+        // Frame deletion is the only delete that can produce a response,
+        // and only to reject a malformed command: a missing image is
+        // logged rather than reported, like every other delete.
+        .animation_frames => |v| switch (storage.deleteAnimationFrame(
+            alloc,
+            terminal,
+            v,
+            storage.animationNowMs() orelse 0,
+        )) {
+            .invalid_identifiers => return .{
+                .id = v.image_id,
+                .image_number = v.image_number,
+                .message = "EINVAL: image ID and number are mutually exclusive",
+            },
+            .changed, .no_op_or_missing => {},
+        },
+
+        else => storage.delete(alloc, terminal, cmd.control.delete),
+    }
 
     // Delete never responds on success
     return .{};
+}
+
+/// Transmit an animation frame ("a=f"), or a continuation chunk of one.
+///
+/// The frame's pixels are composed into an existing image rather than
+/// becoming an image of their own, so unlike a transmit this needs the
+/// target to already exist.
+fn transmitAnimationFrame(
+    alloc: Allocator,
+    terminal: *Terminal,
+    cmd: *const Command,
+) Response {
+    const storage = &terminal.screens.active.kitty_images;
+    const t = cmd.transmission().?;
+
+    // A chunk of a frame already in progress: it carries only "m" and
+    // maybe "q", so the target and parameters come from the initial chunk.
+    if (storage.loading) |loading| {
+        if (loading.frame) |frame| {
+            var result: Response = .{ .id = frame.target_image_id };
+
+            loading.addData(alloc, cmd.data) catch |err| {
+                loading.destroy(alloc);
+                storage.loading = null;
+                encodeError(&result, err);
+                return result;
+            };
+
+            // More to come; intermediate chunks are never responded to.
+            if (t.more_chunks) return .{};
+
+            // That was the last chunk. Take ownership of the load so it
+            // is cleaned up exactly once however this turns out.
+            var owned = loading.*;
+            alloc.destroy(loading);
+            storage.loading = null;
+            return finishAnimationFrame(alloc, terminal, &owned, result);
+        }
+    }
+
+    // --- The initial chunk. ---
+
+    const f = cmd.control.transmit_animation_frame.frame;
+    var result: Response = .{ .id = t.image_id, .image_number = t.image_number };
+
+    const target_id = switch (storage.resolveAnimationImagePtr(
+        t.image_id,
+        t.image_number,
+    )) {
+        .found => |img| img.id,
+        .conflict => {
+            result.message = "EINVAL: image ID and number are mutually exclusive";
+            return result;
+        },
+        .no_identifier => {
+            log.warn("animation frame requires an image id or number", .{});
+            return .{};
+        },
+        .not_found => {
+            result.message = "ENOENT: image not found";
+            return result;
+        },
+    };
+    result.id = target_id;
+
+    var loading = LoadingImage.init(alloc, cmd, storage.image_limits) catch |err| {
+        encodeError(&result, err);
+        return result;
+    };
+    loading.frame = .{ .target_image_id = target_id, .params = f };
+
+    // If more chunks are coming, park the load until they arrive.
+    if (t.more_chunks) {
+        const ptr = alloc.create(LoadingImage) catch {
+            loading.deinit(alloc);
+            result.message = "ENOMEM: out of memory";
+            return result;
+        };
+        ptr.* = loading;
+        storage.loading = ptr;
+        return .{};
+    }
+
+    return finishAnimationFrame(alloc, terminal, &loading, result);
+}
+
+/// Decode a fully-received animation frame and compose it into its image.
+/// Takes ownership of the load, which is cleaned up on every path.
+fn finishAnimationFrame(
+    alloc: Allocator,
+    terminal: *Terminal,
+    loading: *LoadingImage,
+    base: Response,
+) Response {
+    defer loading.deinit(alloc);
+
+    const storage = &terminal.screens.active.kitty_images;
+    const frame = loading.frame.?;
+    var result = base;
+
+    loading.completeFrame(alloc) catch |err| {
+        encodeError(&result, err);
+        return result;
+    };
+
+    // The image can go away between chunks, e.g. evicted to make room for
+    // the very data we were loading.
+    if (storage.images.getPtr(frame.target_image_id) == null) {
+        result.message = "ENOENT: image not found";
+        return result;
+    }
+
+    const stored = storage.addAnimationFrame(
+        alloc,
+        frame.target_image_id,
+        frame.params,
+        loading.data.items,
+        loading.image.format,
+        loading.image.width,
+        loading.image.height,
+        storage.animationNowMs() orelse 0,
+    ) catch |err| {
+        encodeAnimationError(&result, err);
+        return result;
+    };
+
+    // Report the frame we actually resolved to: "r" may have been clamped
+    // or the frame appended, so the client can't work it out itself.
+    result.frame_number = stored.frame;
+    return result;
+}
+
+/// Execute an "a=a" (animation control) command.
+fn controlAnimation(
+    alloc: Allocator,
+    terminal: *Terminal,
+    cmd: *const Command,
+) Response {
+    const storage = &terminal.screens.active.kitty_images;
+    const c = cmd.control.control_animation;
+
+    var result: Response = .{ .id = c.image_id, .image_number = c.image_number };
+
+    const img = switch (storage.resolveAnimationImagePtr(c.image_id, c.image_number)) {
+        .found => |img| img,
+        .conflict => {
+            result.message = "EINVAL: image ID and number are mutually exclusive";
+            return result;
+        },
+        .no_identifier => {
+            log.warn("animation control requires an image id or number", .{});
+            return .{};
+        },
+        .not_found => {
+            result.message = "ENOENT: image not found";
+            return result;
+        },
+    };
+
+    // Controlling an image that has no animation state yet is legal, and
+    // has to allocate it. A command that can't change anything doesn't:
+    // a bare "a=a", or one naming only the frame that's already current,
+    // has nothing to store. Note that this path never touches pixels, so
+    // it neither widens the root nor consumes any of the byte quota.
+    const anim: *kitty_animation.Animation = img.anim orelse anim: {
+        const changes_state = c.action != .invalid or
+            c.loops > 0 or
+            (c.frame > 0 and c.gap != 0);
+        if (!changes_state) return .{};
+
+        const new = alloc.create(kitty_animation.Animation) catch {
+            result.message = "ENOMEM: out of memory";
+            return result;
+        };
+        new.* = .{};
+        img.anim = new;
+        storage.animation_count += 1;
+        break :anim new;
+    };
+
+    const now_ms = storage.animationNowMs() orelse 0;
+
+    // "r" plus "z" sets a frame's gap. This is the only way to give the
+    // root frame one, since it defaults to no gap. An out of range frame
+    // is ignored rather than being an error.
+    if (c.frame > 0 and c.gap != 0 and @as(usize, c.frame) <= anim.frameCount()) {
+        anim.setGap(c.frame - 1, kitty_animation.resolveGap(c.gap));
+    }
+
+    // "c" switches the frame being displayed.
+    var visible = false;
+    if (c.current_frame > 0 and
+        @as(usize, c.current_frame) <= anim.frameCount() and
+        c.current_frame - 1 != anim.current_frame)
+    {
+        anim.current_frame = c.current_frame - 1;
+        anim.last_frame_ms = now_ms;
+        visible = true;
+    }
+
+    // "s" sets the playback state. Any state command restarts the loop
+    // count, and starting a stopped animation restarts its frame timer so
+    // the current frame gets its full gap.
+    if (c.action != .invalid) {
+        const was_stopped = anim.state == .stopped;
+        anim.state = switch (c.action) {
+            .invalid => unreachable,
+            .stop => .stopped,
+            .run_wait => .loading,
+            .run => .running,
+        };
+        anim.current_loop = 0;
+        if (was_stopped and anim.state != .stopped) anim.last_frame_ms = now_ms;
+    }
+
+    // "v" is the loop count, off by one: 1 means loop forever.
+    if (c.loops > 0) anim.max_loops = c.loops - 1;
+
+    if (visible) {
+        // The pixels on screen changed, so the image needs a new stamp to
+        // make the renderer re-upload its texture.
+        storage.markMutated();
+        img.generation = storage.generation;
+    } else {
+        // Gap, state and loop changes only affect *when* frames are
+        // shown. Marking the storage dirty gets the renderer to recompute
+        // its schedule; bumping the generation would pointlessly re-upload
+        // an unchanged texture on every such command.
+        storage.dirty = true;
+    }
+
+    // Kitty sends no response at all for a successful animation control.
+    return .{};
+}
+
+/// Execute an "a=c" (compose animation frames) command.
+fn composeAnimation(
+    alloc: Allocator,
+    terminal: *Terminal,
+    cmd: *const Command,
+) Response {
+    const storage = &terminal.screens.active.kitty_images;
+    const c = cmd.control.compose_animation;
+
+    var result: Response = .{ .id = c.image_id, .image_number = c.image_number };
+
+    const target_id = switch (storage.resolveAnimationImagePtr(
+        c.image_id,
+        c.image_number,
+    )) {
+        .found => |img| img.id,
+        .conflict => {
+            result.message = "EINVAL: image ID and number are mutually exclusive";
+            return result;
+        },
+        .no_identifier => {
+            log.warn("animation compose requires an image id or number", .{});
+            return .{};
+        },
+        .not_found => {
+            result.message = "ENOENT: image not found";
+            return result;
+        },
+    };
+    result.id = target_id;
+
+    _ = storage.composeAnimationFrames(
+        alloc,
+        target_id,
+        c,
+        storage.animationNowMs() orelse 0,
+    ) catch |err| {
+        encodeAnimationError(&result, err);
+        return result;
+    };
+
+    return result;
 }
 
 fn loadAndAddImage(
@@ -376,11 +687,23 @@ fn loadAndAddImage(
 
 const EncodeableError = Image.Error || Allocator.Error;
 
+/// Encode an animation storage error into a message for a response.
+fn encodeAnimationError(r: *Response, err: ImageStorage.AnimationError) void {
+    switch (err) {
+        error.OutOfMemory => r.message = "ENOMEM: out of memory",
+        error.OutOfSpace => r.message = "ENOSPC: no space for animation frame",
+        error.BaseFrameNotFound => r.message = "EINVAL: base frame does not exist",
+        error.FrameNotFound => r.message = "ENOENT: frame does not exist",
+        error.InvalidRect => r.message = "EINVAL: invalid rectangle",
+    }
+}
+
 /// Encode an error code into a message for a response.
 fn encodeError(r: *Response, err: EncodeableError) void {
     switch (err) {
         error.OutOfMemory => r.message = "ENOMEM: out of memory",
         error.InvalidData => r.message = "EINVAL: invalid data",
+        error.InsufficientData => r.message = "ENODATA: insufficient data for frame",
         error.DecompressionFailed => r.message = "EINVAL: decompression failed",
         error.FilePathTooLong => r.message = "EINVAL: file path too long",
         error.TemporaryFileNotInTempDir => r.message = "EINVAL: temporary file not in temp dir",
@@ -655,4 +978,516 @@ test "kittygfx delete then retransmit same id gets fresh generation" {
     const gen2 = storage.imageById(1).?.generation;
     try testing.expect(gen2 > gen1);
     try testing.expect(gen2 > gen_delete);
+}
+
+/// Transmit a 2x2 RGBA image with the given ID for animation tests.
+fn testTransmitImage(alloc: Allocator, t: *Terminal, id: u32) !void {
+    // 2x2 RGBA of all zero bytes, base64 encoded.
+    var buf: [64]u8 = undefined;
+    const str = try std.fmt.bufPrint(
+        &buf,
+        "a=t,f=32,t=d,i={},s=2,v=2;AAAAAAAAAAAAAAAAAAAAAA==",
+        .{id},
+    );
+    const cmd = try command.Parser.parseString(alloc, str);
+    defer cmd.deinit(alloc);
+    const resp = execute(alloc, t, &cmd).?;
+    try std.testing.expect(resp.ok());
+}
+
+test "kittygfx animation frame: append reports resolved frame" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    try testTransmitImage(alloc, &t, 1);
+
+    // A full 2x2 RGBA frame.
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=f,i=1,f=32,s=2,v=2;/////////////////////w==",
+    );
+    defer cmd.deinit(alloc);
+    const resp = execute(alloc, &t, &cmd).?;
+
+    try testing.expect(resp.ok());
+    try testing.expectEqual(@as(u32, 1), resp.id);
+    try testing.expectEqual(@as(u32, 2), resp.frame_number);
+
+    // Encoded, the response reports the frame it resolved to.
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try resp.encode(&writer);
+    try testing.expectEqualStrings("\x1b_Gi=1,r=2;OK\x1b\\", writer.buffered());
+
+    const img = t.screens.active.kitty_images.images.getPtr(1).?;
+    try testing.expectEqual(@as(usize, 1), img.anim.?.frames.items.len);
+    try testing.expectEqual(@as(u32, 40), img.anim.?.frames.items[0].gap_ms);
+}
+
+test "kittygfx animation frame: identifiers" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    try testTransmitImage(alloc, &t, 1);
+
+    // An ID and a number together is invalid.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=f,i=1,I=2,f=32,s=1,v=1;AAAAAA==");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd).?;
+        try testing.expect(std.mem.startsWith(u8, resp.message, "EINVAL"));
+    }
+
+    // No identifier at all is not responded to.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=f,f=32,s=1,v=1;AAAAAA==");
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+
+    // An unknown image, by ID and by number.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=f,i=42,f=32,s=1,v=1;AAAAAA==");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd).?;
+        try testing.expect(std.mem.startsWith(u8, resp.message, "ENOENT"));
+    }
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=f,I=42,f=32,s=1,v=1;AAAAAA==");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd).?;
+        try testing.expect(std.mem.startsWith(u8, resp.message, "ENOENT"));
+    }
+}
+
+test "kittygfx animation frame: data sizing" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    try testTransmitImage(alloc, &t, 1);
+
+    // Short data for the declared rectangle is ENODATA.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=f,i=1,f=32,s=2,v=2;AAAAAA==");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd).?;
+        try testing.expect(std.mem.startsWith(u8, resp.message, "ENODATA"));
+    }
+
+    // Surplus data succeeds, using only the prefix it needs. Here a 1x1
+    // rect is sent two pixels of data.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=f,i=1,f=32,s=1,v=1;/wAA/xERERE=");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+    }
+
+    // A rectangle larger than the image is EINVAL.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=f,i=1,f=32,s=3,v=3;" ++ "/" ** 48,
+        );
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd).?;
+        try testing.expect(std.mem.startsWith(u8, resp.message, "EINVAL"));
+    }
+}
+
+test "kittygfx animation frame: chunked" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    try testTransmitImage(alloc, &t, 1);
+
+    // The initial chunk carries the metadata and is not responded to.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=f,i=1,f=32,s=2,v=2,z=100,m=1;//////////8=",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+        try testing.expect(t.screens.active.kitty_images.loading != null);
+    }
+
+    // The protocol requires "a=f" on every chunk.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=f,m=0;//////////8=");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+        try testing.expectEqual(@as(u32, 2), resp.frame_number);
+    }
+
+    const storage = &t.screens.active.kitty_images;
+    try testing.expect(storage.loading == null);
+    const img = storage.images.getPtr(1).?;
+    try testing.expectEqual(@as(usize, 1), img.anim.?.frames.items.len);
+    try testing.expectEqual(@as(u32, 100), img.anim.?.frames.items[0].gap_ms);
+
+    // The frame parameters came from the initial chunk, not the final one.
+    const expected: [16]u8 = @splat(255);
+    try testing.expectEqualSlices(u8, &expected, img.anim.?.frames.items[0].data);
+}
+
+test "kittygfx animation frame: chunked with actionless final chunk" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    try testTransmitImage(alloc, &t, 1);
+
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=f,i=1,f=32,s=2,v=2,m=1;//////////8=",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+
+    // Ghostty also accepts a final chunk with no action, which parses as
+    // a plain transmit but belongs to the frame load in progress.
+    {
+        const cmd = try command.Parser.parseString(alloc, "m=0;//////////8=");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+        try testing.expectEqual(@as(u32, 2), resp.frame_number);
+    }
+
+    const storage = &t.screens.active.kitty_images;
+    try testing.expect(storage.loading == null);
+    try testing.expectEqual(
+        @as(usize, 1),
+        storage.images.getPtr(1).?.anim.?.frames.items.len,
+    );
+}
+
+test "kittygfx animation frame: chunked failure clears loading" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    try testTransmitImage(alloc, &t, 1);
+
+    // Declare a 2x2 frame but only ever send one pixel.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=f,i=1,f=32,s=2,v=2,m=1;AAAAAA==");
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=f,m=0;");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd).?;
+        try testing.expect(std.mem.startsWith(u8, resp.message, "ENODATA"));
+    }
+
+    // The failed load is cleaned up and the image is untouched.
+    const storage = &t.screens.active.kitty_images;
+    try testing.expect(storage.loading == null);
+    try testing.expect(storage.images.getPtr(1).?.anim == null);
+}
+
+test "kittygfx animation frame: quiet inherits across chunks" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    try testTransmitImage(alloc, &t, 1);
+
+    // q=1 on the initial chunk suppresses the OK from the final one.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=f,i=1,f=32,s=2,v=2,m=1,q=1;////////////////",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=f,m=0;//////////8=");
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+
+    try testing.expectEqual(
+        @as(usize, 1),
+        t.screens.active.kitty_images.images.getPtr(1).?.anim.?.frames.items.len,
+    );
+}
+
+test "kittygfx animation control: no response on success" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    try testTransmitImage(alloc, &t, 1);
+
+    // A successful animation control is silent, even for q=0.
+    const cmd = try command.Parser.parseString(alloc, "a=a,i=1,s=3,v=1");
+    defer cmd.deinit(alloc);
+    try testing.expect(execute(alloc, &t, &cmd) == null);
+
+    const anim = t.screens.active.kitty_images.images.getPtr(1).?.anim.?;
+    try testing.expectEqual(kitty_animation.Animation.State.running, anim.state);
+    try testing.expectEqual(@as(u32, 0), anim.max_loops); // v=1 is forever
+}
+
+test "kittygfx animation control: missing image" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const cmd = try command.Parser.parseString(alloc, "a=a,i=42,s=3");
+    defer cmd.deinit(alloc);
+    const resp = execute(alloc, &t, &cmd).?;
+    try testing.expect(std.mem.startsWith(u8, resp.message, "ENOENT"));
+}
+
+test "kittygfx animation control: gaps loops and frames" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    try testTransmitImage(alloc, &t, 1);
+
+    // Give the root a gap. This is the only way to do it.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=a,i=1,r=1,z=500");
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+
+    const storage = &t.screens.active.kitty_images;
+    const img = storage.images.getPtr(1).?;
+    try testing.expectEqual(@as(u32, 500), img.anim.?.root_gap_ms);
+    try testing.expectEqual(@as(usize, 1), storage.animation_count);
+
+    // A negative gap means gapless.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=a,i=1,r=1,z=-1");
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+    try testing.expectEqual(@as(u32, 0), img.anim.?.root_gap_ms);
+    try testing.expectEqual(@as(u32, 0), img.anim.?.nonzero_gap_count);
+
+    // An out of range frame is ignored rather than being an error.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=a,i=1,r=99,z=100");
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+    try testing.expectEqual(@as(u32, 0), img.anim.?.root_gap_ms);
+
+    // v=5 means four loops.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=a,i=1,v=5");
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+    try testing.expectEqual(@as(u32, 4), img.anim.?.max_loops);
+}
+
+test "kittygfx animation control: bare command allocates nothing" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    try testTransmitImage(alloc, &t, 1);
+
+    const storage = &t.screens.active.kitty_images;
+    const bytes_before = storage.total_bytes;
+
+    // Neither a bare "a=a" nor one naming the frame that's already
+    // current changes anything, so neither needs animation state. Note
+    // this path must not widen the root either.
+    for ([_][]const u8{ "a=a,i=1", "a=a,i=1,c=1" }) |input| {
+        const cmd = try command.Parser.parseString(alloc, input);
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+
+    const img = storage.images.getPtr(1).?;
+    try testing.expect(img.anim == null);
+    try testing.expectEqual(@as(usize, 0), storage.animation_count);
+    try testing.expectEqual(bytes_before, storage.total_bytes);
+    try testing.expectEqual(command.Transmission.Format.rgba, img.format);
+}
+
+test "kittygfx animation control: switching frames" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    try testTransmitImage(alloc, &t, 1);
+
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=f,i=1,f=32,s=2,v=2;/////////////////////w==",
+        );
+        defer cmd.deinit(alloc);
+        _ = execute(alloc, &t, &cmd);
+    }
+
+    const storage = &t.screens.active.kitty_images;
+    const img = storage.images.getPtr(1).?;
+    const gen_before = img.generation;
+
+    // Switching to frame 2 changes the pixels on screen, so the image is
+    // restamped to make the renderer re-upload.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=a,i=1,c=2");
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+    try testing.expectEqual(@as(u32, 1), img.anim.?.current_frame);
+    try testing.expect(img.generation != gen_before);
+    try testing.expectEqual(@as(u8, 255), img.renderData()[0]);
+
+    // A state-only change reschedules but must not restamp the image.
+    const gen_running = img.generation;
+    storage.dirty = false;
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=a,i=1,s=3");
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+    try testing.expectEqual(gen_running, img.generation);
+    try testing.expect(storage.dirty);
+}
+
+test "kittygfx animation compose" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    try testTransmitImage(alloc, &t, 1);
+
+    // Frame 2, all white.
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=f,i=1,f=32,s=2,v=2;/////////////////////w==",
+        );
+        defer cmd.deinit(alloc);
+        _ = execute(alloc, &t, &cmd);
+    }
+
+    // Compose a 1x1 rect from frame 2 (source, "r") onto frame 1
+    // (destination, "c").
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=c,i=1,r=2,c=1,w=1,h=1,C=1");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd).?;
+        try testing.expect(resp.ok());
+    }
+
+    const img = t.screens.active.kitty_images.images.getPtr(1).?;
+    try testing.expectEqualSlices(u8, &.{
+        255, 255, 255, 255, 0, 0, 0, 0,
+        0,   0,   0,   0,   0, 0, 0, 0,
+    }, img.data);
+}
+
+test "kittygfx animation compose: errors" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    try testTransmitImage(alloc, &t, 1);
+
+    // A missing source or destination frame.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=c,i=1,r=9,c=1");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd).?;
+        try testing.expect(std.mem.startsWith(u8, resp.message, "ENOENT"));
+    }
+
+    // Composing a frame onto itself with overlapping rects.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=c,i=1,r=1,c=1");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd).?;
+        try testing.expect(std.mem.startsWith(u8, resp.message, "EINVAL"));
+    }
+
+    // A rect running off the image.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=c,i=1,r=1,c=1,w=2,h=2,x=1");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd).?;
+        try testing.expect(std.mem.startsWith(u8, resp.message, "EINVAL"));
+    }
+}
+
+test "kittygfx delete animation frames" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    try testTransmitImage(alloc, &t, 1);
+
+    {
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=f,i=1,f=32,s=2,v=2;/////////////////////w==",
+        );
+        defer cmd.deinit(alloc);
+        _ = execute(alloc, &t, &cmd);
+    }
+
+    // Deleting a frame never responds.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=d,d=f,i=1,r=2");
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+    const storage = &t.screens.active.kitty_images;
+    try testing.expectEqual(
+        @as(usize, 0),
+        storage.images.getPtr(1).?.anim.?.frames.items.len,
+    );
+
+    // An ID and a number together is still rejected.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=d,d=f,i=1,I=2");
+        defer cmd.deinit(alloc);
+        const resp = execute(alloc, &t, &cmd).?;
+        try testing.expect(std.mem.startsWith(u8, resp.message, "EINVAL"));
+    }
+
+    // With no frames left, the uppercase form deletes the image.
+    {
+        const cmd = try command.Parser.parseString(alloc, "a=d,d=F,i=1");
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd) == null);
+    }
+    try testing.expectEqual(@as(usize, 0), storage.images.count());
 }

@@ -761,6 +761,9 @@ pub const AnimationFrameLoading = struct {
 ///
 /// https://github.com/kovidgoyal/kitty/blob/f47590533d7177daf0b74963f9d1b7581467af20/kitty/graphics.c#L1141
 pub const AnimationFrameComposition = struct {
+    image_id: u32 = 0, // i
+    image_number: u32 = 0, // I
+
     /// The DESTINATION frame, composed onto (1-based), despite the name.
     frame: u32 = 0, // c
 
@@ -783,6 +786,14 @@ pub const AnimationFrameComposition = struct {
 
     fn parse(kv: KV) !AnimationFrameComposition {
         var result: AnimationFrameComposition = .{};
+
+        if (kv.get('i')) |v| {
+            result.image_id = v;
+        }
+
+        if (kv.get('I')) |v| {
+            result.image_number = v;
+        }
 
         if (kv.get('c')) |v| {
             result.frame = v;
@@ -829,6 +840,9 @@ pub const AnimationFrameComposition = struct {
 };
 
 pub const AnimationControl = struct {
+    image_id: u32 = 0, // i
+    image_number: u32 = 0, // I
+
     action: AnimationAction = .invalid, // s
 
     /// The 1-based frame whose gap to set. Zero means no gap change. This
@@ -855,6 +869,14 @@ pub const AnimationControl = struct {
 
     fn parse(kv: KV) !AnimationControl {
         var result: AnimationControl = .{};
+
+        if (kv.get('i')) |v| {
+            result.image_id = v;
+        }
+
+        if (kv.get('I')) |v| {
+            result.image_number = v;
+        }
 
         if (kv.get('s')) |v| {
             result.action = switch (v) {
