@@ -11,6 +11,7 @@ const Response = command.Response;
 const LoadingImage = image.LoadingImage;
 const Image = image.Image;
 const ImageStorage = @import("graphics_storage.zig").ImageStorage;
+const sys = @import("../sys.zig");
 
 const log = std.log.scoped(.kitty_gfx);
 
@@ -1490,4 +1491,73 @@ test "kittygfx delete animation frames" {
         try testing.expect(execute(alloc, &t, &cmd) == null);
     }
     try testing.expectEqual(@as(usize, 0), storage.images.count());
+}
+
+test "kittygfx animation frame: formats agree" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Whatever a frame is transmitted as, it is stored as RGBA, so an
+    // opaque white 2x2 frame is the same bytes every way it can be sent.
+    const white: [2 * 2 * 4]u8 = @splat(255);
+
+    // f=32: RGBA directly.
+    {
+        var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+        defer t.deinit(alloc);
+        try testTransmitImage(alloc, &t, 1);
+
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=f,i=1,f=32,s=2,v=2;/////////////////////w==",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd).?.ok());
+        try testing.expectEqualSlices(
+            u8,
+            &white,
+            t.screens.active.kitty_images.images.getPtr(1).?.anim.?.frames.items[0].data,
+        );
+    }
+
+    // f=24: RGB, widened to opaque RGBA.
+    {
+        var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+        defer t.deinit(alloc);
+        try testTransmitImage(alloc, &t, 1);
+
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=f,i=1,f=24,s=2,v=2;////////////////",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd).?.ok());
+        try testing.expectEqualSlices(
+            u8,
+            &white,
+            t.screens.active.kitty_images.images.getPtr(1).?.anim.?.frames.items[0].data,
+        );
+    }
+
+    // f=100: PNG, which also supplies the rectangle's dimensions itself.
+    {
+        if (sys.decode_png == null) return error.SkipZigTest;
+
+        var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+        defer t.deinit(alloc);
+        try testTransmitImage(alloc, &t, 1);
+
+        const cmd = try command.Parser.parseString(
+            alloc,
+            "a=f,i=1,f=100;iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAYAAABytg0kAAAADklEQVR4nGP4" ++
+                "DwUMMAYAj4IP8TylVlEAAAAASUVORK5CYII=",
+        );
+        defer cmd.deinit(alloc);
+        try testing.expect(execute(alloc, &t, &cmd).?.ok());
+        try testing.expectEqualSlices(
+            u8,
+            &white,
+            t.screens.active.kitty_images.images.getPtr(1).?.anim.?.frames.items[0].data,
+        );
+    }
 }
