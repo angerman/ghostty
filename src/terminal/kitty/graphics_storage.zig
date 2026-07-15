@@ -1,20 +1,66 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const assert = @import("../../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 
+const fastmem = @import("../../fastmem.zig");
 const terminal = @import("../main.zig");
 const point = @import("../point.zig");
 const size = @import("../size.zig");
+const animation = @import("graphics_animation.zig");
 const command = @import("graphics_command.zig");
 const PageList = @import("../PageList.zig");
 const Screen = @import("../Screen.zig");
 const LoadingImage = @import("graphics_image.zig").LoadingImage;
 const Image = @import("graphics_image.zig").Image;
 const Rect = @import("graphics_image.zig").Rect;
+const Animation = animation.Animation;
 const Command = command.Command;
 
 const log = std.log.scoped(.kitty_gfx);
+
+const freestanding_wasm = builtin.target.cpu.arch == .wasm32 and
+    builtin.target.os.tag == .freestanding;
+
+/// The clock that drives animation playback, as milliseconds since an
+/// epoch established the first time it is read.
+///
+/// Every animation timestamp must come from one of these: the times
+/// stamped when a command changes the current frame, and the deadlines
+/// the renderer computes, are compared directly against each other, so
+/// mixing in wall-clock time or a second epoch would produce nonsense
+/// deadlines. Each ImageStorage owns exactly one.
+const AnimationClock = if (freestanding_wasm) struct {
+    /// Freestanding wasm cannot reference std.time.Instant at all, because
+    /// Zig's Instant depends on POSIX timespec for that target (the same
+    /// reason SelectionGesture.Time exists). Animation state still updates
+    /// there, but nothing ever advances it on a timer.
+    fn nowMs(_: *@This()) ?u64 {
+        return null;
+    }
+} else struct {
+    epoch: ?std.time.Instant = null,
+    unavailable: bool = false,
+
+    fn nowMs(self: *@This()) ?u64 {
+        if (self.unavailable) return null;
+
+        const now = std.time.Instant.now() catch {
+            // Log once rather than on every frame. Playback stays dormant.
+            log.warn("no monotonic clock, kitty graphics animation disabled", .{});
+            self.unavailable = true;
+            return null;
+        };
+
+        const epoch = self.epoch orelse epoch: {
+            self.epoch = now;
+            break :epoch now;
+        };
+
+        return now.since(epoch) / std.time.ns_per_ms;
+    }
+};
 
 /// Process-global counter backing all generation stamps (see
 /// ImageStorage.generation and Image.generation). This is global rather
@@ -128,8 +174,21 @@ pub const ImageStorage = struct {
     /// The total bytes of image data that have been loaded and the limit.
     /// If the limit is reached, the oldest images will be evicted to make
     /// space. Unused images take priority.
+    ///
+    /// Animation frames are charged against this same limit. Kitty gives
+    /// frames a separate quota five times this size, but it can spill them
+    /// to a disk cache and we can't, so we deliberately keep the single
+    /// in-RAM budget.
     total_bytes: usize = 0,
     total_limit: usize = 320 * 1000 * 1000, // 320MB
+
+    /// The number of images that have animation state. This lets playback
+    /// scans early-out in O(1) for the overwhelmingly common case of no
+    /// animations at all, without a flag that could drift out of sync.
+    animation_count: usize = 0,
+
+    /// The clock for animation playback. Read it via animationNowMs.
+    animation_clock: AnimationClock = .{},
 
     pub fn deinit(
         self: *ImageStorage,
@@ -198,10 +257,10 @@ pub const ImageStorage = struct {
     /// free any existing image with the same ID.
     pub fn addImage(self: *ImageStorage, alloc: Allocator, img: Image) Allocator.Error!void {
         // If the image itself is over the limit, then error immediately
-        if (img.data.len > self.total_limit) return error.OutOfMemory;
+        if (img.byteSize() > self.total_limit) return error.OutOfMemory;
 
         // If this would put us over the limit, then evict.
-        const total_bytes = self.total_bytes + img.data.len;
+        const total_bytes = self.total_bytes + img.byteSize();
         if (total_bytes > self.total_limit) {
             const req_bytes = total_bytes - self.total_limit;
             log.info("evicting images to make space for {} bytes", .{req_bytes});
@@ -222,12 +281,16 @@ pub const ImageStorage = struct {
 
         // Write our new image
         if (gop.found_existing) {
-            self.total_bytes -= gop.value_ptr.data.len;
+            // Retransmitting an ID replaces the image wholesale, which
+            // drops any animation it had (both the frames and the playback
+            // state), matching Kitty.
+            self.total_bytes -= gop.value_ptr.byteSize();
+            if (gop.value_ptr.anim != null) self.animation_count -= 1;
             gop.value_ptr.deinit(alloc);
         }
 
         gop.value_ptr.* = img;
-        self.total_bytes += img.data.len;
+        self.total_bytes += img.byteSize();
 
         // Stamp the stored image with a fresh generation. This gives
         // every add/replace a unique stamp even when the same image ID
@@ -305,6 +368,550 @@ pub const ImageStorage = struct {
         }
 
         return newest;
+    }
+
+    /// The current animation time in milliseconds, or null if this target
+    /// has no monotonic clock and animation therefore never advances.
+    ///
+    /// Both command execution and the renderer must timestamp through this
+    /// one function, while holding the terminal state mutex, so that every
+    /// animation timestamp shares a single clock domain.
+    pub fn animationNowMs(self: *ImageStorage) ?u64 {
+        return self.animation_clock.nowMs();
+    }
+
+    /// Errors from the animation frame operations below. graphics_exec.zig
+    /// maps these onto the protocol's error responses.
+    pub const AnimationError = error{
+        /// We can't make room for the frame within the storage limit.
+        OutOfSpace,
+        /// The base frame for a new frame doesn't exist.
+        BaseFrameNotFound,
+        /// A source or destination frame doesn't exist.
+        FrameNotFound,
+        /// A rectangle doesn't fit in the image, or a same-frame
+        /// composition would overlap itself.
+        InvalidRect,
+    } || Allocator.Error;
+
+    /// A planned eviction that would make room for some number of bytes.
+    ///
+    /// Preparing and committing are separate so that an animation frame
+    /// operation can do every fallible step -- planning the eviction,
+    /// allocating buffers, growing the frame list -- before anything
+    /// becomes visible. Committing then cannot fail, so the operation as a
+    /// whole is atomic: it either happens completely, or it leaves the
+    /// storage entirely untouched.
+    ///
+    /// A plan is only valid while the terminal state mutex is held, since
+    /// that is what keeps the candidate set stable underneath it.
+    const AnimationReservation = struct {
+        /// The images to evict, best candidate first. Empty when the new
+        /// bytes already fit and nothing has to go.
+        victims: []const EvictionCandidate = &.{},
+
+        /// The number of bytes the eviction has to free.
+        required: usize = 0,
+
+        fn deinit(self: *const AnimationReservation, alloc: Allocator) void {
+            alloc.free(self.victims);
+        }
+
+        /// Evict the planned images. This cannot fail.
+        fn commit(
+            self: *const AnimationReservation,
+            storage: *ImageStorage,
+            alloc: Allocator,
+        ) void {
+            var evicted: usize = 0;
+            for (self.victims) |c| {
+                // Note that this matches evictImage in dropping the
+                // placements without deiniting them.
+                var p_it = storage.placements.iterator();
+                while (p_it.next()) |entry| {
+                    if (entry.key_ptr.image_id == c.id) {
+                        storage.placements.removeByPtr(entry.key_ptr);
+                    }
+                }
+
+                if (storage.images.getEntry(c.id)) |entry| {
+                    log.info("evicting image id={} bytes={}", .{ c.id, c.bytes });
+                    evicted += storage.removeImage(alloc, entry);
+                    storage.markMutated();
+                }
+
+                if (evicted >= self.required) break;
+            }
+        }
+    };
+
+    /// Plan how to fit `delta` more bytes of image data, evicting images
+    /// other than `exclude_image_id` if necessary. Does not mutate
+    /// anything; see AnimationReservation.
+    ///
+    /// Returns OutOfSpace if the other images could not free enough, in
+    /// which case the storage is left completely unchanged.
+    fn prepareAnimationReservation(
+        self: *const ImageStorage,
+        alloc: Allocator,
+        delta: usize,
+        exclude_image_id: u32,
+    ) AnimationError!AnimationReservation {
+        // A frame canvas can be hundreds of megabytes, so this is checked.
+        const total = std.math.add(usize, self.total_bytes, delta) catch
+            return error.OutOfSpace;
+        if (total <= self.total_limit) return .{};
+
+        const required = total - self.total_limit;
+
+        const candidates = try self.evictionCandidates(alloc, exclude_image_id);
+        errdefer alloc.free(candidates);
+
+        // Take candidates until they cover what we need. Freeing exactly
+        // the required bytes is success, not failure.
+        var evictable: usize = 0;
+        var count: usize = 0;
+        for (candidates) |c| {
+            evictable += c.bytes;
+            count += 1;
+            if (evictable >= required) break;
+        }
+
+        if (evictable < required) {
+            alloc.free(candidates);
+            return error.OutOfSpace;
+        }
+
+        return .{
+            .victims = try alloc.realloc(candidates, count),
+            .required = required,
+        };
+    }
+
+    /// The outcome of storing an animation frame.
+    pub const FrameResult = struct {
+        /// The 1-based frame number that was created or edited. The
+        /// protocol requires reporting this back, and it can't be derived
+        /// from the request because "r" may have been clamped or appended.
+        frame: u32,
+
+        /// True if the pixels currently on screen changed, i.e. the frame
+        /// we touched happens to be the one being displayed.
+        visible: bool,
+    };
+
+    /// Store an animation frame, per "a=f".
+    ///
+    /// `src` is the transmitted rectangle's pixels, already decompressed
+    /// and PNG-decoded, `rect_width` x `rect_height` in `src_format`. It
+    /// is composed onto either a newly created frame or an existing one,
+    /// per the rules in `params`.
+    ///
+    /// This is transactional: on any error nothing at all changes, and on
+    /// success the caller only has to deal with the response.
+    pub fn addAnimationFrame(
+        self: *ImageStorage,
+        alloc: Allocator,
+        image_id: u32,
+        params: command.AnimationFrameLoading,
+        src: []const u8,
+        src_format: command.Transmission.Format,
+        rect_width: u32,
+        rect_height: u32,
+        now_ms: u64,
+    ) AnimationError!FrameResult {
+        const img = self.images.getPtr(image_id).?;
+
+        // The transmitted rectangle has to fit the image. Note that unlike
+        // "a=c" the offset is not checked: an off-canvas rectangle simply
+        // clips, and may clip away entirely.
+        if (rect_width > img.width or rect_height > img.height) {
+            return error.InvalidRect;
+        }
+
+        const canvas_len: usize = @as(usize, img.width) * img.height * 4;
+        const frame_count: u32 = @intCast(if (img.anim) |a| a.frameCount() else 1);
+
+        // Kitty clamps an out-of-range or absent "r" to one past the last
+        // frame, which means "append a new frame".
+        const is_new = params.edit_frame == 0 or params.edit_frame > frame_count;
+        const frame: u32 = if (is_new) frame_count + 1 else params.edit_frame;
+
+        // The base canvas for a new frame must exist if one was named.
+        if (is_new and params.create_frame > 0 and
+            params.create_frame > frame_count)
+        {
+            return error.BaseFrameNotFound;
+        }
+
+        // Every composition is RGBA-on-RGBA, so the root frame is widened
+        // on the first command that touches frame pixels and stays RGBA
+        // from then on. We also need a fresh root buffer when editing the
+        // root frame, so that a failure can't leave it half-composed.
+        const root_is_target = !is_new and frame == 1;
+        const need_root = img.format != .rgba or root_is_target;
+        const root_growth: usize = if (need_root) canvas_len - img.data.len else 0;
+
+        // Reserve space before touching anything. Only a new frame and a
+        // widened root grow the persistent total; replacing an existing
+        // frame with a same-sized canvas doesn't.
+        const delta = root_growth + if (is_new) canvas_len else 0;
+        var reservation = try self.prepareAnimationReservation(alloc, delta, image_id);
+        defer reservation.deinit(alloc);
+
+        // --- Fallible work. Nothing below is visible until we commit. ---
+
+        const new_root: ?[]u8 = if (need_root)
+            try animation.allocRGBA(alloc, img.data, img.format)
+        else
+            null;
+        errdefer if (new_root) |r| alloc.free(r);
+
+        // The composed pixels of a 1-based frame, preferring the widened
+        // root we're about to install so the base is always RGBA.
+        const frameData = struct {
+            fn f(i: *const Image, root: ?[]u8, n: u32) []const u8 {
+                if (n == 1) return if (root) |r| r else i.data;
+                return i.anim.?.frames.items[n - 2].data;
+            }
+        }.f;
+
+        // The buffer we compose into: a new canvas, or a copy of the frame
+        // being edited. Editing the root composes into its widened copy.
+        const target: []u8 = target: {
+            if (root_is_target) break :target new_root.?;
+
+            const buf = try alloc.alloc(u8, canvas_len);
+            errdefer alloc.free(buf);
+
+            if (is_new) {
+                // A new frame starts as a copy of its base frame, or as a
+                // flat fill of the background color if it has no base.
+                if (params.create_frame > 0) {
+                    fastmem.copy(u8, buf, frameData(img, new_root, params.create_frame));
+                } else {
+                    animation.fill(buf, params.background);
+                }
+            } else {
+                fastmem.copy(u8, buf, img.anim.?.frames.items[frame - 2].data);
+            }
+
+            break :target buf;
+        };
+        errdefer if (!root_is_target) alloc.free(target);
+
+        // Widen the transmitted rectangle and compose it.
+        const src_rgba = try animation.allocRGBA(alloc, src, src_format);
+        defer alloc.free(src_rgba);
+        animation.composeTransmitted(
+            target,
+            img.width,
+            img.height,
+            src_rgba,
+            rect_width,
+            rect_height,
+            params.x,
+            params.y,
+            params.composition_mode,
+        );
+
+        const anim_is_new = img.anim == null;
+        const anim: *Animation = img.anim orelse try alloc.create(Animation);
+        errdefer if (anim_is_new) alloc.destroy(anim);
+        if (anim_is_new) anim.* = .{};
+
+        // Grow the frame list up front so appending below cannot fail.
+        if (is_new) try anim.frames.ensureUnusedCapacity(alloc, 1);
+
+        // --- Commit. Nothing from here on may fail. ---
+
+        reservation.commit(self, alloc);
+
+        if (anim_is_new) {
+            img.anim = anim;
+            self.animation_count += 1;
+        }
+
+        if (new_root) |root| {
+            self.total_bytes = self.total_bytes - img.data.len + root.len;
+            alloc.free(img.data);
+            img.data = root;
+            img.format = .rgba;
+        }
+
+        if (is_new) {
+            // A new frame is never the current one, so it can't be
+            // visible however it was composed.
+            anim.appendFrameAssumeCapacity(.{
+                .data = target,
+                .gap_ms = animation.resolveNewGap(params.gap),
+            });
+            self.total_bytes += target.len;
+        } else if (!root_is_target) {
+            const old = anim.frames.items[frame - 2].data;
+            assert(old.len == target.len);
+            alloc.free(old);
+            anim.frames.items[frame - 2].data = target;
+        }
+
+        // A zero gap on an edit means "leave it alone".
+        if (!is_new and params.gap != 0) {
+            anim.setGap(frame - 1, animation.resolveGap(params.gap));
+        }
+
+        // The frame set or its pixels changed either way, but only stamp
+        // the image (and so force a texture re-upload) when what's on
+        // screen actually changed.
+        self.markMutated();
+        const visible = !is_new and frame - 1 == anim.current_frame;
+        if (visible) {
+            img.generation = self.generation;
+
+            // Editing the visible frame restarts its gap interval, so it
+            // stays up for the full new gap rather than a leftover slice.
+            anim.last_frame_ms = now_ms;
+        }
+
+        return .{ .frame = frame, .visible = visible };
+    }
+
+    /// Compose one frame's rectangle onto another, per "a=c".
+    ///
+    /// Transactional in the same way as addAnimationFrame. Returns true if
+    /// the composition changed the pixels currently on screen.
+    pub fn composeAnimationFrames(
+        self: *ImageStorage,
+        alloc: Allocator,
+        image_id: u32,
+        params: command.AnimationFrameComposition,
+        now_ms: u64,
+    ) AnimationError!bool {
+        const img = self.images.getPtr(image_id).?;
+
+        // Remember that the names lie: "r" is the source, "c" is the
+        // destination, X/Y offset into the source and x/y into the dest.
+        const src_frame = params.edit_frame;
+        const dst_frame = params.frame;
+        const frame_count: u32 = @intCast(if (img.anim) |a| a.frameCount() else 1);
+        if (src_frame == 0 or src_frame > frame_count) return error.FrameNotFound;
+        if (dst_frame == 0 or dst_frame > frame_count) return error.FrameNotFound;
+
+        // An absent width/height means the whole image.
+        const w = if (params.width == 0) img.width else params.width;
+        const h = if (params.height == 0) img.height else params.height;
+
+        // Both rectangles must fit inside the image.
+        if (@as(u64, params.left_edge) + w > img.width or
+            @as(u64, params.top_edge) + h > img.height or
+            @as(u64, params.x) + w > img.width or
+            @as(u64, params.y) + h > img.height)
+        {
+            return error.InvalidRect;
+        }
+
+        // Composing a frame onto itself is only meaningful if the source
+        // and destination rectangles are disjoint.
+        if (src_frame == dst_frame and animation.rectsOverlap(
+            params.left_edge,
+            params.top_edge,
+            params.x,
+            params.y,
+            w,
+            h,
+        )) {
+            return error.InvalidRect;
+        }
+
+        const canvas_len: usize = @as(usize, img.width) * img.height * 4;
+
+        // As in addAnimationFrame, all composition is RGBA-on-RGBA, and
+        // the destination is composed as a fresh buffer so that a failure
+        // can't leave a frame half written. When the destination is the
+        // root frame, that fresh buffer is also its widened copy.
+        const root_is_target = dst_frame == 1;
+        const need_root = img.format != .rgba or root_is_target;
+        const root_growth: usize = if (img.format != .rgba)
+            canvas_len - img.data.len
+        else
+            0;
+        var reservation = try self.prepareAnimationReservation(alloc, root_growth, image_id);
+        defer reservation.deinit(alloc);
+
+        // --- Fallible work. Nothing below is visible until we commit. ---
+
+        const new_root: ?[]u8 = if (need_root)
+            try animation.allocRGBA(alloc, img.data, img.format)
+        else
+            null;
+        errdefer if (new_root) |r| alloc.free(r);
+
+        // The composed pixels of a 1-based frame, preferring the widened
+        // root we're about to install so the source is always RGBA.
+        const frameData = struct {
+            fn f(i: *const Image, root: ?[]u8, n: u32) []const u8 {
+                if (n == 1) return if (root) |r| r else i.data;
+                return i.anim.?.frames.items[n - 2].data;
+            }
+        }.f;
+
+        const target: []u8 = target: {
+            if (root_is_target) break :target new_root.?;
+            const buf = try alloc.alloc(u8, canvas_len);
+            errdefer alloc.free(buf);
+            fastmem.copy(u8, buf, img.anim.?.frames.items[dst_frame - 2].data);
+            break :target buf;
+        };
+        errdefer if (!root_is_target) alloc.free(target);
+
+        // Note that composing a frame onto itself reads and writes the
+        // same buffer, which is safe only because the rectangles were
+        // checked to be disjoint above.
+        animation.composeFrames(
+            target,
+            frameData(img, new_root, src_frame),
+            img.width,
+            w,
+            h,
+            params.left_edge,
+            params.top_edge,
+            params.x,
+            params.y,
+            params.composition_mode,
+        );
+
+        // --- Commit. Nothing from here on may fail. ---
+
+        reservation.commit(self, alloc);
+
+        if (new_root) |root| {
+            self.total_bytes = self.total_bytes - img.data.len + root.len;
+            alloc.free(img.data);
+            img.data = root;
+            img.format = .rgba;
+        }
+
+        if (!root_is_target) {
+            const old = img.anim.?.frames.items[dst_frame - 2].data;
+            assert(old.len == target.len);
+            alloc.free(old);
+            img.anim.?.frames.items[dst_frame - 2].data = target;
+        }
+
+        self.markMutated();
+
+        // Note that an image with no animation state at all can only be
+        // composing its root onto itself, which is always what's on
+        // screen. There's nothing to play, so no state is created for it.
+        const visible = if (img.anim) |anim|
+            dst_frame - 1 == anim.current_frame
+        else
+            true;
+        if (visible) {
+            img.generation = self.generation;
+            if (img.anim) |anim| anim.last_frame_ms = now_ms;
+        }
+
+        return visible;
+    }
+
+    /// The outcome of a frame deletion. Deleting never responds on
+    /// success or when the image is simply missing, so the only thing the
+    /// caller needs to distinguish is a malformed command.
+    pub const FrameDeleteResult = enum {
+        changed,
+        no_op_or_missing,
+        invalid_identifiers,
+    };
+
+    /// Delete a single animation frame, per "d=f" / "d=F".
+    ///
+    /// This isn't in the published spec at all; it follows Kitty's
+    /// implementation. Deleting the root frame promotes the next frame
+    /// into its place, and the uppercase form deletes the whole image if
+    /// there are no frames to delete.
+    pub fn deleteAnimationFrame(
+        self: *ImageStorage,
+        alloc: Allocator,
+        t: *terminal.Terminal,
+        v: @FieldType(command.Delete, "animation_frames"),
+        now_ms: u64,
+    ) FrameDeleteResult {
+        if (v.image_id > 0 and v.image_number > 0) return .invalid_identifiers;
+        if (v.image_id == 0 and v.image_number == 0) {
+            log.warn("delete animation frame requires an image id or number", .{});
+            return .no_op_or_missing;
+        }
+
+        const image_id = if (v.image_id > 0) v.image_id else id: {
+            const img = self.imageByNumber(v.image_number) orelse {
+                log.warn("delete animation frame: no image number={}", .{v.image_number});
+                return .no_op_or_missing;
+            };
+            break :id img.id;
+        };
+
+        const img = self.images.getPtr(image_id) orelse {
+            log.warn("delete animation frame: no image id={}", .{image_id});
+            return .no_op_or_missing;
+        };
+
+        // With no frames to delete, the uppercase form deletes the whole
+        // image and the lowercase form does nothing.
+        const frame_count: usize = if (img.anim) |a| a.frameCount() else 1;
+        if (frame_count == 1) {
+            if (!v.delete) return .no_op_or_missing;
+            self.deleteById(alloc, t.screens.active, image_id, 0, true);
+            self.markMutated();
+            return .changed;
+        }
+
+        const anim = img.anim.?;
+
+        // The frame number defaults to the first and is clamped into range.
+        const frame: usize = if (v.frame == 0) 1 else @min(v.frame, frame_count);
+
+        // Compare the buffer on screen before and after rather than
+        // reasoning about indices: promoting a frame to root can leave the
+        // very same pixels displayed even though the index changed. No
+        // allocation happens in between, so the "before" address can't be
+        // reused and a match really does mean nothing moved.
+        const before = @intFromPtr(img.renderData().ptr);
+
+        // The 0-based slot in `frames` that goes away. Deleting the root
+        // consumes frame 2, so its slot is the one removed.
+        const removed: usize = if (frame == 1) 0 else frame - 2;
+
+        if (frame == 1) {
+            // Frame 2 becomes the new root. We take over its buffer, so
+            // only the old root's bytes go away.
+            self.total_bytes -= img.data.len;
+            alloc.free(img.data);
+            img.data = anim.frames.items[0].data;
+            anim.setGap(0, anim.frames.items[0].gap_ms);
+            _ = anim.removeFrame(0);
+        } else {
+            const dead = anim.removeFrame(removed);
+            self.total_bytes -= dead.data.len;
+            alloc.free(dead.data);
+        }
+
+        // Kitty's rules for where the current frame lands.
+        const len = anim.frames.items.len;
+        if (anim.current_frame > len) {
+            anim.current_frame = @intCast(len);
+        } else if (removed < anim.current_frame) {
+            anim.current_frame -= 1;
+        }
+
+        // The stored frames changed either way, but only stamp the image
+        // when what's actually on screen changed.
+        self.markMutated();
+        if (before != @intFromPtr(img.renderData().ptr)) {
+            img.generation = self.generation;
+            anim.last_frame_ms = now_ms;
+        }
+
+        return .changed;
     }
 
     /// Delete placements, images.
@@ -512,9 +1119,15 @@ pub const ImageStorage = struct {
                 }
             },
 
-            // We don't support animation frames yet so they are successfully
-            // deleted!
-            .animation_frames => {},
+            // Frame deletion can report a malformed command, which this
+            // void API can't express, so graphics_exec.zig calls the
+            // helper directly. Delegate for any other caller.
+            .animation_frames => |v| _ = self.deleteAnimationFrame(
+                alloc,
+                t,
+                v,
+                self.animationNowMs() orelse 0,
+            ),
         }
     }
 
@@ -561,10 +1174,27 @@ pub const ImageStorage = struct {
 
         // If we get here, we can delete the image.
         if (self.images.getEntry(image_id)) |entry| {
-            self.total_bytes -= entry.value_ptr.data.len;
-            entry.value_ptr.deinit(alloc);
-            self.images.removeByPtr(entry.key_ptr);
+            _ = self.removeImage(alloc, entry);
         }
+    }
+
+    /// Remove an image from the map, freeing it and keeping every piece of
+    /// accounting (byte total, animation count) in step. Returns the bytes
+    /// freed, which includes any animation frames the image owned.
+    ///
+    /// This is the only way images should be removed: doing it by hand is
+    /// how the byte total drifts.
+    fn removeImage(
+        self: *ImageStorage,
+        alloc: Allocator,
+        entry: ImageMap.Entry,
+    ) usize {
+        const bytes = entry.value_ptr.byteSize();
+        self.total_bytes -= bytes;
+        if (entry.value_ptr.anim != null) self.animation_count -= 1;
+        entry.value_ptr.deinit(alloc);
+        self.images.removeByPtr(entry.key_ptr);
+        return bytes;
     }
 
     /// Deletes all placements intersecting a screen point.
@@ -602,21 +1232,71 @@ pub const ImageStorage = struct {
     fn evictImage(self: *ImageStorage, alloc: Allocator, req: usize) !bool {
         assert(req <= self.total_limit);
 
-        // Ironically we allocate to evict. We should probably redesign the
-        // data structures to avoid this but for now allocating a little
-        // bit is fine compared to the megabytes we're looking to save.
-        const Candidate = struct {
-            id: u32,
-            generation: u64,
-            used: bool,
-        };
+        const candidates = try self.evictionCandidates(alloc, 0);
+        defer alloc.free(candidates);
 
-        var candidates: std.ArrayList(Candidate) = .empty;
+        // Evicting anything is a content mutation. This matters for the
+        // setLimit path in particular, which doesn't otherwise mark it.
+        var any_evicted = false;
+        defer if (any_evicted) self.markMutated();
+
+        // They're in order of best to evict.
+        var evicted: usize = 0;
+        for (candidates) |c| {
+            // Delete all the placements for this image and the image.
+            var p_it = self.placements.iterator();
+            while (p_it.next()) |entry| {
+                if (entry.key_ptr.image_id == c.id) {
+                    self.placements.removeByPtr(entry.key_ptr);
+                    any_evicted = true;
+                }
+            }
+
+            if (self.images.getEntry(c.id)) |entry| {
+                log.info("evicting image id={} bytes={}", .{ c.id, entry.value_ptr.byteSize() });
+
+                evicted += self.removeImage(alloc, entry);
+                any_evicted = true;
+
+                if (evicted > req) return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// An image that could be evicted to make space, along with what we
+    /// order eviction by.
+    const EvictionCandidate = struct {
+        id: u32,
+        generation: u64,
+        used: bool,
+        bytes: usize,
+    };
+
+    /// Build the list of images that could be evicted, best candidate
+    /// first: unused images before used ones, oldest before newest.
+    ///
+    /// `exclude_image_id` is never a candidate. Animation frame operations
+    /// use this so that an image can't be evicted to make room for its own
+    /// new frame. Image IDs are always nonzero, so 0 excludes nothing.
+    ///
+    /// Ironically we allocate to evict. We should probably redesign the
+    /// data structures to avoid this but for now allocating a little
+    /// bit is fine compared to the megabytes we're looking to save.
+    /// The caller owns the returned slice.
+    fn evictionCandidates(
+        self: *const ImageStorage,
+        alloc: Allocator,
+        exclude_image_id: u32,
+    ) Allocator.Error![]EvictionCandidate {
+        var candidates: std.ArrayList(EvictionCandidate) = .empty;
         defer candidates.deinit(alloc);
 
         var it = self.images.iterator();
         while (it.next()) |kv| {
             const img = kv.value_ptr;
+            if (img.id == exclude_image_id) continue;
 
             // This is a huge waste. See comment above about redesigning
             // our data structures to avoid this. Eviction should be very
@@ -637,19 +1317,19 @@ pub const ImageStorage = struct {
                 .id = img.id,
                 .generation = img.generation,
                 .used = used,
+                .bytes = img.byteSize(),
             });
         }
 
-        // Sort
         std.mem.sortUnstable(
-            Candidate,
+            EvictionCandidate,
             candidates.items,
             {},
             struct {
                 fn lessThan(
                     ctx: void,
-                    lhs: Candidate,
-                    rhs: Candidate,
+                    lhs: EvictionCandidate,
+                    rhs: EvictionCandidate,
                 ) bool {
                     _ = ctx;
 
@@ -668,38 +1348,7 @@ pub const ImageStorage = struct {
             }.lessThan,
         );
 
-        // Evicting anything is a content mutation. This matters for the
-        // setLimit path in particular, which doesn't otherwise mark it.
-        var any_evicted = false;
-        defer if (any_evicted) self.markMutated();
-
-        // They're in order of best to evict.
-        var evicted: usize = 0;
-        for (candidates.items) |c| {
-            // Delete all the placements for this image and the image.
-            var p_it = self.placements.iterator();
-            while (p_it.next()) |entry| {
-                if (entry.key_ptr.image_id == c.id) {
-                    self.placements.removeByPtr(entry.key_ptr);
-                    any_evicted = true;
-                }
-            }
-
-            if (self.images.getEntry(c.id)) |entry| {
-                log.info("evicting image id={} bytes={}", .{ c.id, entry.value_ptr.data.len });
-
-                evicted += entry.value_ptr.data.len;
-                self.total_bytes -= entry.value_ptr.data.len;
-
-                entry.value_ptr.deinit(alloc);
-                self.images.removeByPtr(entry.key_ptr);
-                any_evicted = true;
-
-                if (evicted > req) return true;
-            }
-        }
-
-        return false;
+        return try candidates.toOwnedSlice(alloc);
     }
 
     /// Every placement is uniquely identified by the image ID and the
@@ -1598,4 +2247,714 @@ test "storage: no-op delete does not mark a mutation" {
     s.delete(alloc, &t, .{ .id = .{ .image_id = 1 } });
     try testing.expect(s.dirty);
     try testing.expect(s.generation > gen);
+}
+
+/// Add an image whose pixel data is `fill` repeated, for animation tests.
+fn testAddImage(
+    s: *ImageStorage,
+    alloc: Allocator,
+    id: u32,
+    width: u32,
+    height: u32,
+    format: command.Transmission.Format,
+    fill: u8,
+) !void {
+    const bpp = command.Transmission.formatBpp(format);
+    const data = try alloc.alloc(u8, width * height * bpp);
+    @memset(data, fill);
+    errdefer alloc.free(data);
+    try s.addImage(alloc, .{
+        .id = id,
+        .width = width,
+        .height = height,
+        .format = format,
+        .data = data,
+    });
+}
+
+test "storage: animation frame append" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddImage(&s, alloc, 1, 2, 2, .rgba, 0);
+
+    // A full-canvas frame with no explicit gap.
+    const src: [2 * 2 * 4]u8 = @splat(7);
+    const result = try s.addAnimationFrame(alloc, 1, .{}, &src, .rgba, 2, 2, 100);
+
+    // The frame is appended as protocol frame 2 and is never the current
+    // one, so nothing on screen changed.
+    try testing.expectEqual(@as(u32, 2), result.frame);
+    try testing.expect(!result.visible);
+
+    const img = s.images.getPtr(1).?;
+    const anim = img.anim.?;
+    try testing.expectEqual(@as(usize, 1), anim.frames.items.len);
+    try testing.expectEqual(animation.default_gap_ms, anim.frames.items[0].gap_ms);
+    try testing.expectEqual(@as(u32, 1), anim.nonzero_gap_count);
+    try testing.expectEqualSlices(u8, &src, anim.frames.items[0].data);
+    try testing.expectEqual(@as(usize, 1), s.animation_count);
+
+    // The root is still what's rendered.
+    try testing.expectEqualSlices(u8, img.data, img.renderData());
+}
+
+test "storage: animation frame widens the root" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    // An RGB root is 12 bytes for 2x2.
+    try testAddImage(&s, alloc, 1, 2, 2, .rgb, 3);
+    try testing.expectEqual(@as(usize, 12), s.total_bytes);
+
+    const src: [2 * 2 * 3]u8 = @splat(9);
+    _ = try s.addAnimationFrame(alloc, 1, .{}, &src, .rgb, 2, 2, 0);
+
+    // The root is widened to RGBA once, and both it and the new frame are
+    // charged: 16 + 16.
+    const img = s.images.getPtr(1).?;
+    try testing.expectEqual(command.Transmission.Format.rgba, img.format);
+    try testing.expectEqual(@as(usize, 32), s.total_bytes);
+    try testing.expectEqual(@as(usize, 32), img.byteSize());
+    try testing.expectEqualSlices(
+        u8,
+        &.{ 3, 3, 3, 255, 3, 3, 3, 255, 3, 3, 3, 255, 3, 3, 3, 255 },
+        img.data,
+    );
+
+    // The transmitted RGB rect is widened too.
+    try testing.expectEqualSlices(
+        u8,
+        &.{ 9, 9, 9, 255, 9, 9, 9, 255, 9, 9, 9, 255, 9, 9, 9, 255 },
+        img.anim.?.frames.items[0].data,
+    );
+}
+
+test "storage: animation frame edit" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddImage(&s, alloc, 1, 2, 2, .rgba, 0);
+
+    const src: [2 * 2 * 4]u8 = @splat(7);
+    _ = try s.addAnimationFrame(alloc, 1, .{}, &src, .rgba, 2, 2, 0);
+
+    // Editing a frame that isn't current changes no visible pixels, so
+    // the image keeps its generation stamp.
+    const img = s.images.getPtr(1).?;
+    const gen_before = img.generation;
+    const one: [1 * 1 * 4]u8 = @splat(5);
+    const edit = try s.addAnimationFrame(
+        alloc,
+        1,
+        .{ .edit_frame = 2, .x = 1, .y = 1, .composition_mode = .overwrite },
+        &one,
+        .rgba,
+        1,
+        1,
+        500,
+    );
+    try testing.expectEqual(@as(u32, 2), edit.frame);
+    try testing.expect(!edit.visible);
+    try testing.expectEqual(gen_before, img.generation);
+    try testing.expectEqual(@as(usize, 1), img.anim.?.frames.items.len);
+    try testing.expectEqualSlices(u8, &.{
+        7, 7, 7, 7, 7, 7, 7, 7,
+        7, 7, 7, 7, 5, 5, 5, 5,
+    }, img.anim.?.frames.items[0].data);
+
+    // Editing the current frame (the root) does change what's on screen.
+    const edit_root = try s.addAnimationFrame(
+        alloc,
+        1,
+        .{ .edit_frame = 1, .composition_mode = .overwrite },
+        &src,
+        .rgba,
+        2,
+        2,
+        500,
+    );
+    try testing.expectEqual(@as(u32, 1), edit_root.frame);
+    try testing.expect(edit_root.visible);
+    try testing.expectEqual(s.generation, img.generation);
+    try testing.expectEqual(@as(u64, 500), img.anim.?.last_frame_ms);
+}
+
+test "storage: animation frame clamps out of range edits" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddImage(&s, alloc, 1, 1, 1, .rgba, 0);
+
+    const src: [4]u8 = @splat(1);
+
+    // "r" past the end appends rather than failing, and reports the frame
+    // it actually resolved to.
+    const far = try s.addAnimationFrame(alloc, 1, .{ .edit_frame = 99 }, &src, .rgba, 1, 1, 0);
+    try testing.expectEqual(@as(u32, 2), far.frame);
+
+    // The next frame number is an append too.
+    const next = try s.addAnimationFrame(alloc, 1, .{ .edit_frame = 3 }, &src, .rgba, 1, 1, 0);
+    try testing.expectEqual(@as(u32, 3), next.frame);
+    try testing.expectEqual(@as(usize, 2), s.images.getPtr(1).?.anim.?.frames.items.len);
+}
+
+test "storage: animation frame errors leave storage untouched" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddImage(&s, alloc, 1, 2, 2, .rgba, 4);
+
+    const bytes_before = s.total_bytes;
+    const gen_before = s.generation;
+
+    // A rect bigger than the image is rejected...
+    const big: [3 * 3 * 4]u8 = @splat(1);
+    try testing.expectError(error.InvalidRect, s.addAnimationFrame(
+        alloc,
+        1,
+        .{},
+        &big,
+        .rgba,
+        3,
+        3,
+        0,
+    ));
+
+    // ...as is a base frame that doesn't exist.
+    const src: [2 * 2 * 4]u8 = @splat(1);
+    try testing.expectError(error.BaseFrameNotFound, s.addAnimationFrame(
+        alloc,
+        1,
+        .{ .create_frame = 5 },
+        &src,
+        .rgba,
+        2,
+        2,
+        0,
+    ));
+
+    // Neither touched anything at all.
+    const img = s.images.getPtr(1).?;
+    try testing.expect(img.anim == null);
+    try testing.expectEqual(@as(usize, 0), s.animation_count);
+    try testing.expectEqual(bytes_before, s.total_bytes);
+    try testing.expectEqual(gen_before, s.generation);
+    try testing.expectEqual(command.Transmission.Format.rgba, img.format);
+}
+
+test "storage: animation frame base canvas and background" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddImage(&s, alloc, 1, 2, 1, .rgba, 8);
+
+    // A new frame based on the root starts as a copy of it, with the
+    // transmitted rect composed over the left pixel only.
+    const one: [4]u8 = .{ 1, 2, 3, 255 };
+    _ = try s.addAnimationFrame(
+        alloc,
+        1,
+        .{ .create_frame = 1, .composition_mode = .overwrite },
+        &one,
+        .rgba,
+        1,
+        1,
+        0,
+    );
+    try testing.expectEqualSlices(
+        u8,
+        &.{ 1, 2, 3, 255, 8, 8, 8, 8 },
+        s.images.getPtr(1).?.anim.?.frames.items[0].data,
+    );
+
+    // With no base frame the canvas is the background color instead.
+    _ = try s.addAnimationFrame(
+        alloc,
+        1,
+        .{ .background = .{ .r = 9, .a = 255 }, .composition_mode = .overwrite },
+        &one,
+        .rgba,
+        1,
+        1,
+        0,
+    );
+    try testing.expectEqualSlices(
+        u8,
+        &.{ 1, 2, 3, 255, 9, 0, 0, 255 },
+        s.images.getPtr(1).?.anim.?.frames.items[1].data,
+    );
+}
+
+test "storage: retransmit clears animation" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddImage(&s, alloc, 1, 2, 2, .rgba, 0);
+
+    const src: [2 * 2 * 4]u8 = @splat(7);
+    _ = try s.addAnimationFrame(alloc, 1, .{}, &src, .rgba, 2, 2, 0);
+    try testing.expectEqual(@as(usize, 1), s.animation_count);
+    try testing.expectEqual(@as(usize, 32), s.total_bytes);
+
+    // Retransmitting the same ID drops the animation entirely, and all of
+    // its frame bytes with it.
+    try testAddImage(&s, alloc, 1, 2, 2, .rgba, 1);
+    try testing.expectEqual(@as(usize, 0), s.animation_count);
+    try testing.expectEqual(@as(usize, 16), s.total_bytes);
+    try testing.expect(s.images.getPtr(1).?.anim == null);
+}
+
+test "storage: deleting an image frees its frame bytes" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddImage(&s, alloc, 1, 2, 2, .rgba, 0);
+
+    const src: [2 * 2 * 4]u8 = @splat(7);
+    _ = try s.addAnimationFrame(alloc, 1, .{}, &src, .rgba, 2, 2, 0);
+    try testing.expectEqual(@as(usize, 32), s.total_bytes);
+
+    s.delete(alloc, &t, .{ .id = .{ .image_id = 1, .delete = true } });
+    try testing.expectEqual(@as(usize, 0), s.total_bytes);
+    try testing.expectEqual(@as(usize, 0), s.animation_count);
+    try testing.expectEqual(@as(usize, 0), s.images.count());
+}
+
+test "storage: animation reservation evicts but excludes the target" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    // Two 2x2 RGBA images is 32 bytes; the limit leaves room for exactly
+    // one more frame.
+    try testAddImage(&s, alloc, 1, 2, 2, .rgba, 1);
+    try testAddImage(&s, alloc, 2, 2, 2, .rgba, 2);
+    s.total_limit = 32;
+
+    // Adding a frame to image 2 needs 16 bytes, which can only come from
+    // evicting image 1: the target must never be evicted to make room for
+    // its own frame.
+    const src: [2 * 2 * 4]u8 = @splat(7);
+    _ = try s.addAnimationFrame(alloc, 2, .{}, &src, .rgba, 2, 2, 0);
+
+    try testing.expect(s.images.getPtr(1) == null);
+    try testing.expectEqual(@as(usize, 32), s.total_bytes);
+    try testing.expectEqual(@as(usize, 1), s.images.getPtr(2).?.anim.?.frames.items.len);
+}
+
+test "storage: animation frame over the limit fails cleanly" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddImage(&s, alloc, 1, 2, 2, .rgba, 1);
+
+    // Only the target exists, and it can't be evicted for itself, so
+    // there's no way to find room for the frame.
+    s.total_limit = 16;
+    const src: [2 * 2 * 4]u8 = @splat(7);
+    try testing.expectError(error.OutOfSpace, s.addAnimationFrame(
+        alloc,
+        1,
+        .{},
+        &src,
+        .rgba,
+        2,
+        2,
+        0,
+    ));
+
+    // Nothing changed.
+    try testing.expectEqual(@as(usize, 16), s.total_bytes);
+    try testing.expect(s.images.getPtr(1).?.anim == null);
+    try testing.expectEqual(@as(usize, 0), s.animation_count);
+}
+
+test "storage: compose animation frames" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddImage(&s, alloc, 1, 2, 1, .rgba, 0);
+
+    // Frame 2 is all 7s.
+    const src: [2 * 1 * 4]u8 = @splat(7);
+    _ = try s.addAnimationFrame(alloc, 1, .{ .composition_mode = .overwrite }, &src, .rgba, 2, 1, 0);
+
+    // Compose the left pixel of frame 2 (source, "r") onto the right
+    // pixel of frame 1 (destination, "c"). The root is current, so this
+    // changes what's on screen.
+    const visible = try s.composeAnimationFrames(alloc, 1, .{
+        .edit_frame = 2,
+        .frame = 1,
+        .width = 1,
+        .height = 1,
+        .left_edge = 0,
+        .top_edge = 0,
+        .x = 1,
+        .y = 0,
+        .composition_mode = .overwrite,
+    }, 700);
+    try testing.expect(visible);
+
+    const img = s.images.getPtr(1).?;
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0, 7, 7, 7, 7 }, img.data);
+    try testing.expectEqual(s.generation, img.generation);
+    try testing.expectEqual(@as(u64, 700), img.anim.?.last_frame_ms);
+}
+
+test "storage: compose animation frames validates" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddImage(&s, alloc, 1, 2, 2, .rgba, 0);
+
+    // Missing source and destination frames.
+    try testing.expectError(error.FrameNotFound, s.composeAnimationFrames(alloc, 1, .{
+        .edit_frame = 0,
+        .frame = 1,
+    }, 0));
+    try testing.expectError(error.FrameNotFound, s.composeAnimationFrames(alloc, 1, .{
+        .edit_frame = 1,
+        .frame = 9,
+    }, 0));
+
+    // A rect running off the image, in the source and in the dest.
+    try testing.expectError(error.InvalidRect, s.composeAnimationFrames(alloc, 1, .{
+        .edit_frame = 1,
+        .frame = 1,
+        .width = 2,
+        .height = 2,
+        .left_edge = 1,
+    }, 0));
+    try testing.expectError(error.InvalidRect, s.composeAnimationFrames(alloc, 1, .{
+        .edit_frame = 1,
+        .frame = 1,
+        .width = 2,
+        .height = 2,
+        .x = 1,
+    }, 0));
+
+    // Composing a frame onto itself with overlapping rects.
+    try testing.expectError(error.InvalidRect, s.composeAnimationFrames(alloc, 1, .{
+        .edit_frame = 1,
+        .frame = 1,
+        .width = 2,
+        .height = 2,
+    }, 0));
+
+    // But the same frame with disjoint rects is fine.
+    _ = try s.composeAnimationFrames(alloc, 1, .{
+        .edit_frame = 1,
+        .frame = 1,
+        .width = 1,
+        .height = 1,
+        .left_edge = 1,
+        .x = 0,
+    }, 0);
+}
+
+/// Build an image with `extra` animation frames beyond the root, each
+/// filled with a distinct byte (root is 1, frame 2 is 2, ...) so that a
+/// test can tell which frame is being rendered from a single pixel.
+fn testAddAnimatedImage(
+    s: *ImageStorage,
+    alloc: Allocator,
+    id: u32,
+    extra: u8,
+) !void {
+    try testAddImage(s, alloc, id, 1, 1, .rgba, 1);
+    for (0..extra) |i| {
+        const src: [4]u8 = @splat(@intCast(i + 2));
+        _ = try s.addAnimationFrame(
+            alloc,
+            id,
+            .{ .composition_mode = .overwrite },
+            &src,
+            .rgba,
+            1,
+            1,
+            0,
+        );
+    }
+}
+
+test "storage: delete animation frame identifiers" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddAnimatedImage(&s, alloc, 1, 1);
+
+    // An ID and a number together is malformed.
+    try testing.expectEqual(ImageStorage.FrameDeleteResult.invalid_identifiers, s.deleteAnimationFrame(
+        alloc,
+        &t,
+        .{ .image_id = 1, .image_number = 1 },
+        0,
+    ));
+
+    // Neither identifier, and an identifier that resolves to nothing, are
+    // both quietly ignored.
+    try testing.expectEqual(ImageStorage.FrameDeleteResult.no_op_or_missing, s.deleteAnimationFrame(
+        alloc,
+        &t,
+        .{},
+        0,
+    ));
+    try testing.expectEqual(ImageStorage.FrameDeleteResult.no_op_or_missing, s.deleteAnimationFrame(
+        alloc,
+        &t,
+        .{ .image_id = 42 },
+        0,
+    ));
+}
+
+test "storage: delete animation frame with no frames" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddImage(&s, alloc, 1, 1, 1, .rgba, 1);
+    try s.addPlacement(alloc, 1, 0, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
+    });
+
+    // The lowercase form has nothing to delete.
+    try testing.expectEqual(ImageStorage.FrameDeleteResult.no_op_or_missing, s.deleteAnimationFrame(
+        alloc,
+        &t,
+        .{ .image_id = 1 },
+        0,
+    ));
+    try testing.expectEqual(@as(usize, 1), s.images.count());
+
+    // The uppercase form deletes the whole image and its placements.
+    try testing.expectEqual(ImageStorage.FrameDeleteResult.changed, s.deleteAnimationFrame(
+        alloc,
+        &t,
+        .{ .image_id = 1, .delete = true },
+        0,
+    ));
+    try testing.expectEqual(@as(usize, 0), s.images.count());
+    try testing.expectEqual(@as(usize, 0), s.placements.count());
+    try testing.expectEqual(@as(usize, 0), s.total_bytes);
+}
+
+test "storage: delete animation root frame promotes" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    // Root=1, frame 2=2, frame 3=3, each 4 bytes.
+    try testAddAnimatedImage(&s, alloc, 1, 2);
+    try testing.expectEqual(@as(usize, 12), s.total_bytes);
+
+    const img = s.images.getPtr(1).?;
+    img.anim.?.setGap(0, 111);
+    img.anim.?.setGap(1, 222);
+    const gen_before = img.generation;
+
+    // Deleting the root promotes frame 2 into it, taking over both its
+    // buffer and its gap. Only the old root's bytes go away.
+    try testing.expectEqual(ImageStorage.FrameDeleteResult.changed, s.deleteAnimationFrame(
+        alloc,
+        &t,
+        .{ .image_id = 1, .frame = 1 },
+        900,
+    ));
+
+    try testing.expectEqual(@as(usize, 8), s.total_bytes);
+    try testing.expectEqual(@as(usize, 2), img.anim.?.frameCount());
+    try testing.expectEqual(@as(u32, 222), img.anim.?.root_gap_ms);
+
+    // The promoted root (222) and the remaining frame (the default gap)
+    // are both nonzero.
+    try testing.expectEqual(@as(u32, 2), img.anim.?.nonzero_gap_count);
+
+    // The root frame was on screen, so the pixels changed: frame 2 is now
+    // showing, and the image is stamped and its interval restarted.
+    try testing.expectEqual(@as(u8, 2), img.renderData()[0]);
+    try testing.expect(img.generation != gen_before);
+    try testing.expectEqual(s.generation, img.generation);
+    try testing.expectEqual(@as(u64, 900), img.anim.?.last_frame_ms);
+}
+
+test "storage: delete animation root frame keeping current pixels" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddAnimatedImage(&s, alloc, 1, 2);
+
+    const img = s.images.getPtr(1).?;
+
+    // Frame 2 is current, and deleting the root promotes frame 2 into the
+    // root slot: the index changes but the very same pixels stay up, so
+    // the image must NOT be restamped.
+    img.anim.?.current_frame = 1;
+    const gen_before = img.generation;
+    img.anim.?.last_frame_ms = 5;
+
+    try testing.expectEqual(ImageStorage.FrameDeleteResult.changed, s.deleteAnimationFrame(
+        alloc,
+        &t,
+        .{ .image_id = 1, .frame = 1 },
+        900,
+    ));
+
+    try testing.expectEqual(@as(u32, 0), img.anim.?.current_frame);
+    try testing.expectEqual(@as(u8, 2), img.renderData()[0]);
+    try testing.expectEqual(gen_before, img.generation);
+    try testing.expectEqual(@as(u64, 5), img.anim.?.last_frame_ms);
+}
+
+test "storage: delete animation frame current index rules" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    // Deleting a frame before the current one shifts the current index
+    // down so the same frame stays on screen.
+    {
+        var s: ImageStorage = .{};
+        defer s.deinit(alloc, t.screens.active);
+        try testAddAnimatedImage(&s, alloc, 1, 2);
+        const img = s.images.getPtr(1).?;
+        img.anim.?.current_frame = 2; // frame 3
+
+        _ = s.deleteAnimationFrame(alloc, &t, .{ .image_id = 1, .frame = 2 }, 0);
+        try testing.expectEqual(@as(u32, 1), img.anim.?.current_frame);
+        try testing.expectEqual(@as(u8, 3), img.renderData()[0]);
+        try testing.expectEqual(@as(usize, 8), s.total_bytes);
+    }
+
+    // Deleting a frame after the current one leaves it alone.
+    {
+        var s: ImageStorage = .{};
+        defer s.deinit(alloc, t.screens.active);
+        try testAddAnimatedImage(&s, alloc, 1, 2);
+        const img = s.images.getPtr(1).?;
+        img.anim.?.current_frame = 1; // frame 2
+
+        _ = s.deleteAnimationFrame(alloc, &t, .{ .image_id = 1, .frame = 3 }, 0);
+        try testing.expectEqual(@as(u32, 1), img.anim.?.current_frame);
+        try testing.expectEqual(@as(u8, 2), img.renderData()[0]);
+    }
+
+    // Deleting the current frame when it's last clamps back onto the new
+    // last frame, which is different pixels.
+    {
+        var s: ImageStorage = .{};
+        defer s.deinit(alloc, t.screens.active);
+        try testAddAnimatedImage(&s, alloc, 1, 2);
+        const img = s.images.getPtr(1).?;
+        img.anim.?.current_frame = 2; // frame 3
+        const gen_before = img.generation;
+
+        _ = s.deleteAnimationFrame(alloc, &t, .{ .image_id = 1, .frame = 3 }, 900);
+        try testing.expectEqual(@as(u32, 1), img.anim.?.current_frame);
+        try testing.expectEqual(@as(u8, 2), img.renderData()[0]);
+        try testing.expect(img.generation != gen_before);
+        try testing.expectEqual(@as(u64, 900), img.anim.?.last_frame_ms);
+    }
+
+    // Deleting the only extra frame while it is current falls back to the
+    // root.
+    {
+        var s: ImageStorage = .{};
+        defer s.deinit(alloc, t.screens.active);
+        try testAddAnimatedImage(&s, alloc, 1, 1);
+        const img = s.images.getPtr(1).?;
+        img.anim.?.current_frame = 1;
+
+        _ = s.deleteAnimationFrame(alloc, &t, .{ .image_id = 1, .frame = 2 }, 0);
+        try testing.expectEqual(@as(u32, 0), img.anim.?.current_frame);
+        try testing.expectEqual(@as(u8, 1), img.renderData()[0]);
+        try testing.expectEqual(@as(usize, 0), img.anim.?.frames.items.len);
+    }
+}
+
+test "storage: delete animation frame clamps" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddAnimatedImage(&s, alloc, 1, 2);
+    const img = s.images.getPtr(1).?;
+
+    // Out of range clamps onto the last frame rather than failing.
+    _ = s.deleteAnimationFrame(alloc, &t, .{ .image_id = 1, .frame = 99 }, 0);
+    try testing.expectEqual(@as(usize, 1), img.anim.?.frames.items.len);
+    try testing.expectEqual(@as(u8, 2), img.anim.?.frames.items[0].data[0]);
+
+    // Frame 0 means the first frame, i.e. the root.
+    _ = s.deleteAnimationFrame(alloc, &t, .{ .image_id = 1, .frame = 0 }, 0);
+    try testing.expectEqual(@as(u8, 2), img.renderData()[0]);
+    try testing.expectEqual(@as(usize, 0), img.anim.?.frames.items.len);
 }

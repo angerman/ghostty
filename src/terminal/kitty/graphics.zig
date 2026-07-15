@@ -16,12 +16,14 @@
 //! aim to ship a v1 of this implementation came at some cost. I learned a lot
 //! though and I think we can go back through and fix this up.
 
+const animation = @import("graphics_animation.zig");
 const render = @import("graphics_render.zig");
 const command = @import("graphics_command.zig");
 const exec = @import("graphics_exec.zig");
 const image = @import("graphics_image.zig");
 const storage = @import("graphics_storage.zig");
 pub const unicode = @import("graphics_unicode.zig");
+pub const Animation = animation.Animation;
 pub const Command = command.Command;
 pub const CommandParser = command.Parser;
 pub const Image = image.Image;

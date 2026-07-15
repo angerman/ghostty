@@ -7,6 +7,7 @@ const posix = std.posix;
 
 const fastmem = @import("../../fastmem.zig");
 const command = @import("graphics_command.zig");
+const Animation = @import("graphics_animation.zig").Animation;
 const PageList = @import("../PageList.zig");
 const sys = @import("../sys.zig");
 
@@ -504,6 +505,11 @@ pub const LoadingImage = struct {
 /// is completed, so `compression` is always `.none` and `format` is
 /// never `.png` for a stored image, and `data.len` always equals
 /// `width * height * bytes-per-pixel`.
+///
+/// For an animated image, `data` is the root frame (protocol frame 1) and
+/// the remaining frames hang off `anim`. Use `renderData`/`renderFormat`
+/// rather than `data`/`format` to get the pixels that should currently be
+/// shown.
 pub const Image = struct {
     id: u32 = 0,
     number: u32 = 0,
@@ -512,6 +518,12 @@ pub const Image = struct {
     format: command.Transmission.Format = .rgb,
     compression: command.Transmission.Compression = .none,
     data: []const u8 = "",
+
+    /// The animation state, non-null only for images that have taken part
+    /// in an animation command. This is behind a pointer so that an Image
+    /// copied by value out of the storage map still observes the live
+    /// state; all *mutation* must go through ImageStorage.images.getPtr.
+    anim: ?*Animation = null,
 
     /// Unique, monotonically increasing stamp assigned each time an
     /// image is added to (or replaced in) an ImageStorage. A changed
@@ -542,6 +554,38 @@ pub const Image = struct {
 
     pub fn deinit(self: *Image, alloc: Allocator) void {
         if (self.data.len > 0) alloc.free(self.data);
+        if (self.anim) |anim| {
+            anim.deinit(alloc);
+            alloc.destroy(anim);
+            self.anim = null;
+        }
+    }
+
+    /// The total bytes of pixel data owned by this image, including every
+    /// animation frame. Storage accounting must use this rather than
+    /// data.len, or frame bytes would never be charged or refunded.
+    pub fn byteSize(self: *const Image) usize {
+        var total = self.data.len;
+        if (self.anim) |anim| {
+            for (anim.frames.items) |frame| total += frame.data.len;
+        }
+        return total;
+    }
+
+    /// The pixel data to render right now: the current animation frame, or
+    /// simply the image data when there's no animation.
+    pub fn renderData(self: *const Image) []const u8 {
+        const anim = self.anim orelse return self.data;
+        if (anim.current_frame == 0) return self.data;
+        return anim.frames.items[anim.current_frame - 1].data;
+    }
+
+    /// The pixel format of renderData. Frames beyond the root are always
+    /// stored as fully-composed RGBA, whatever the root was transmitted as.
+    pub fn renderFormat(self: *const Image) command.Transmission.Format {
+        const anim = self.anim orelse return self.format;
+        if (anim.current_frame == 0) return self.format;
+        return .rgba;
     }
 
     /// Mostly for logging
