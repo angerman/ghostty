@@ -228,6 +228,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// a large screen.
         terminal_state_frame_count: usize = 0,
 
+        /// How long from the end of the last updateFrame until the next
+        /// Kitty animation frame is due, or null if nothing is animating.
+        /// The renderer thread arms its animation timer from this.
+        ///
+        /// This is a *relative* delay rather than a deadline so that the
+        /// thread never has to read the image storage, or its clock,
+        /// outside the terminal state mutex. Written by updateFrame and
+        /// read by the renderer thread afterwards; both are the renderer
+        /// thread, so it needs no synchronization of its own.
+        next_animation_delay_ms: ?u64 = null,
+
         /// Our overlay state, if any.
         overlay: ?Overlay = null,
 
@@ -1135,6 +1146,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             //     );
             // }
 
+            // Clear any animation schedule before we can return early:
+            // whatever we knew is stale, and a frame we don't render is a
+            // frame we shouldn't be waking up for. It's recomputed below
+            // if anything is actually animating.
+            self.next_animation_delay_ms = null;
+
             // We fully deinit and reset the terminal state every so often
             // so that a particularly large terminal state doesn't cause
             // the renderer to hold on to retained memory.
@@ -1251,6 +1268,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         },
                     );
                 }
+
+                // Work out when the next Kitty animation frame is due, so
+                // the thread can arm a timer for exactly that moment. This
+                // is unconditional: an animation can become due without
+                // the image state being dirty at all, which is precisely
+                // the case a timer exists to handle.
+                self.next_animation_delay_ms = animation: {
+                    const storage = &state.terminal.screens.active.kitty_images;
+                    const now_ms = storage.animationNowMs() orelse break :animation null;
+                    const due_ms = storage.nextAnimationDeadline() orelse break :animation null;
+
+                    // An overdue animation still waits a tick rather than
+                    // firing a zero-delay timer.
+                    break :animation @max(due_ms -| now_ms, 1);
+                };
 
                 // Get our OSC8 links we're hovering if we have a mouse.
                 // This requires terminal state because of URLs.

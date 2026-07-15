@@ -596,6 +596,13 @@ pub const State = struct {
         alloc: Allocator,
         image: *const terminal.kitty.graphics.Image,
     ) PrepImageError!void {
+        // An animated image renders its current frame rather than its own
+        // data. Every frame has the image's dimensions, so nothing else
+        // about the placement changes. The image's generation is bumped
+        // whenever the frame changes, which is what gets us back here to
+        // re-upload the texture.
+        const data = image.renderData();
+
         try self.prepImage(
             alloc,
             .{ .kitty = image.id },
@@ -603,7 +610,7 @@ pub const State = struct {
             .{
                 .width = image.width,
                 .height = image.height,
-                .pixel_format = switch (image.format) {
+                .pixel_format = switch (image.renderFormat()) {
                     .gray => .gray,
                     .gray_alpha => .gray_alpha,
                     .rgb => .rgb,
@@ -614,7 +621,7 @@ pub const State = struct {
                 // constCasts are always gross but this one is safe is because
                 // the data is only read from here and copied into its own
                 // buffer.
-                .data = @constCast(image.data.ptr),
+                .data = @constCast(data.ptr),
             },
         );
     }

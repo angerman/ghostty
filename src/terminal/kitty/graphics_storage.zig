@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const assert = @import("../../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -20,9 +19,6 @@ const Command = command.Command;
 
 const log = std.log.scoped(.kitty_gfx);
 
-const freestanding_wasm = builtin.target.cpu.arch == .wasm32 and
-    builtin.target.os.tag == .freestanding;
-
 /// The clock that drives animation playback, as milliseconds since an
 /// epoch established the first time it is read.
 ///
@@ -31,23 +27,20 @@ const freestanding_wasm = builtin.target.cpu.arch == .wasm32 and
 /// the renderer computes, are compared directly against each other, so
 /// mixing in wall-clock time or a second epoch would produce nonsense
 /// deadlines. Each ImageStorage owns exactly one.
-const AnimationClock = if (freestanding_wasm) struct {
-    /// Freestanding wasm cannot reference std.time.Instant at all, because
-    /// Zig's Instant depends on POSIX timespec for that target (the same
-    /// reason SelectionGesture.Time exists). Animation state still updates
-    /// there, but nothing ever advances it on a timer.
-    fn nowMs(_: *@This()) ?u64 {
-        return null;
-    }
-} else struct {
+///
+/// Note that needing a monotonic clock at all is why the whole protocol
+/// is compiled out on freestanding targets (see terminal/build_options),
+/// so std.time.Instant is always available to us here.
+const AnimationClock = struct {
     epoch: ?std.time.Instant = null,
     unavailable: bool = false,
 
-    fn nowMs(self: *@This()) ?u64 {
+    fn nowMs(self: *AnimationClock) ?u64 {
         if (self.unavailable) return null;
 
         const now = std.time.Instant.now() catch {
-            // Log once rather than on every frame. Playback stays dormant.
+            // Log once rather than on every frame. Animation state still
+            // updates, but nothing ever advances it.
             log.warn("no monotonic clock, kitty graphics animation disabled", .{});
             self.unavailable = true;
             return null;

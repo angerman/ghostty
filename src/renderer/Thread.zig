@@ -73,6 +73,14 @@ cursor_h: xev.Timer,
 cursor_c: xev.Completion = .{},
 cursor_c_cancel: xev.Completion = .{},
 
+/// The timer used to advance Kitty graphics animations. Unlike the draw
+/// timer this is not a fixed interval: it is armed for exactly when the
+/// next frame is due, so an idle animation costs one wakeup per frame gap
+/// and a screen with no animations costs nothing at all.
+anim_h: xev.Timer,
+anim_c: xev.Completion = .{},
+anim_c_cancel: xev.Completion = .{},
+
 /// Incremental scrollback compression scheduling.
 compression: Compression = undefined,
 
@@ -164,6 +172,10 @@ pub fn init(
     var cursor_timer = try xev.Timer.init();
     errdefer cursor_timer.deinit();
 
+    // Kitty graphics animation timer, see comments.
+    var anim_timer = try xev.Timer.init();
+    errdefer anim_timer.deinit();
+
     // The mailbox for messaging this thread
     var mailbox = try Mailbox.create(alloc);
     errdefer mailbox.destroy(alloc);
@@ -178,6 +190,7 @@ pub fn init(
         .draw_h = draw_h,
         .draw_now = draw_now,
         .cursor_h = cursor_timer,
+        .anim_h = anim_timer,
         .surface = surface,
         .renderer = renderer_impl,
         .state = state,
@@ -203,6 +216,7 @@ pub fn deinit(self: *Thread) void {
     self.draw_h.deinit();
     self.draw_now.deinit();
     self.cursor_h.deinit();
+    self.anim_h.deinit();
     if (comptime terminalpkg.compression_enabled)
         self.compression.deinit();
     self.loop.deinit();
@@ -384,7 +398,27 @@ fn drainMailbox(self: *Thread) !void {
                         self.flags.cursor_blink_visible,
                     ) catch |err|
                         log.warn("error rendering on visibility regain err={}", .{err});
+
+                    // Resume animating. Note an overdue animation advances
+                    // one frame immediately rather than making up the time
+                    // it spent occluded.
+                    self.syncAnimationTimer();
+
                     self.drawFrame(false);
+                } else if (self.anim_c.state() == .active and
+                    self.anim_c_cancel.state() == .dead)
+                {
+                    // Occluded windows animate nothing, so stop the timer
+                    // now rather than waiting for its deadline to come
+                    // around and find there's nothing to do.
+                    self.anim_h.cancel(
+                        &self.loop,
+                        &self.anim_c,
+                        &self.anim_c_cancel,
+                        void,
+                        null,
+                        animCancelCallback,
+                    );
                 }
 
                 // Notify the renderer so it can update any state.
@@ -396,6 +430,11 @@ fn drainMailbox(self: *Thread) !void {
                 // state across different transitions is going to be bug-prone,
                 // so its easier to just let them keep firing and have them
                 // check the visible state themselves to control their behavior.
+                //
+                // The animation timer above is the exception: it takes the
+                // terminal state lock to do real work, and its whole point
+                // is to cost one wakeup per frame gap, so letting it fire
+                // against an occluded window would defeat it.
             },
 
             .focus => |v| focus: {
@@ -653,8 +692,140 @@ fn renderCallback(
     ) catch |err|
         log.warn("error rendering err={}", .{err});
 
+    // Re-arm (or cancel) the animation timer for whatever updateFrame
+    // just found.
+    t.syncAnimationTimer();
+
     // Draw
     t.drawFrame(false);
+
+    return .disarm;
+}
+
+/// Arm the animation timer to fire in delay_ms, moving its deadline if it
+/// is already armed. This never touches terminal state.
+fn scheduleAnimationDelay(self: *Thread, delay_ms: u64) void {
+    self.anim_h.reset(
+        &self.loop,
+        &self.anim_c,
+        &self.anim_c_cancel,
+        delay_ms,
+        Thread,
+        self,
+        animTimerCallback,
+    );
+}
+
+/// Bring the animation timer in line with what the last updateFrame found:
+/// armed for the next due frame, or cancelled if nothing is animating.
+///
+/// updateFrame stashes a relative delay rather than a deadline precisely so
+/// that this can run without reading the image storage or its clock, both
+/// of which need the terminal state mutex.
+fn syncAnimationTimer(self: *Thread) void {
+    if (self.renderer.next_animation_delay_ms) |delay_ms| {
+        self.scheduleAnimationDelay(delay_ms);
+        return;
+    }
+
+    // Nothing to animate. Cancel an outstanding timer rather than letting
+    // it fire and find nothing to do.
+    if (self.anim_c.state() == .active and
+        self.anim_c_cancel.state() == .dead)
+    {
+        self.anim_h.cancel(
+            &self.loop,
+            &self.anim_c,
+            &self.anim_c_cancel,
+            void,
+            null,
+            animCancelCallback,
+        );
+    }
+}
+
+fn animCancelCallback(
+    _: ?*void,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.CancelError!void,
+) xev.CallbackAction {
+    // As in cursorCancelCallback, this unifies the error set because
+    // different platforms support different sets of errors.
+    const CancelError = xev.Timer.CancelError || error{
+        Canceled,
+        NotFound,
+        Unexpected,
+    };
+
+    _ = r catch |err| switch (@as(CancelError, @errorCast(err))) {
+        error.Canceled => {}, // success
+        error.NotFound => {}, // completed before it could cancel
+        else => log.warn("error in animation cancel callback err={}", .{err}),
+    };
+
+    return .disarm;
+}
+
+fn animTimerCallback(
+    self_: ?*Thread,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = r catch |err| switch (err) {
+        // This is sent when our timer is canceled. That's fine.
+        error.Canceled => return .disarm,
+
+        else => {
+            log.warn("error in animation timer callback err={}", .{err});
+            return .disarm;
+        },
+    };
+
+    const t: *Thread = self_ orelse {
+        log.warn("animation callback fired without data set", .{});
+        return .disarm;
+    };
+
+    // Occluded windows don't animate. We'll re-arm on the way back in,
+    // when updateFrame recomputes the schedule.
+    if (!t.flags.visible) return .disarm;
+
+    const delay: ?u64, const dirtied: bool = advance: {
+        // Ticking mutates terminal state, so it needs the state mutex.
+        // It must be lockDemand rather than a plain lock, or the IO parse
+        // thread can starve us. See renderer.State.lockDemand.
+        t.state.lockDemand();
+        defer t.state.unlockDemand();
+
+        // Rendering is paused during synchronized output, so there's no
+        // point advancing a frame nobody will see. Leave the timer
+        // disarmed; the updateFrame that follows the end of synchronized
+        // output re-arms it.
+        if (t.state.terminal.modes.get(.synchronized_output)) break :advance .{ null, false };
+
+        const storage = &t.state.terminal.screens.active.kitty_images;
+        const now_ms = storage.animationNowMs() orelse break :advance .{ null, false };
+        const result = storage.animationTick(now_ms);
+
+        // Note we use the deadline even when nothing was dirtied: an
+        // animation that simply wasn't due yet still needs a wakeup.
+        break :advance .{
+            if (result.next_due_ms) |due| @max(due -| now_ms, 1) else null,
+            result.dirtied,
+        };
+    };
+
+    // A null delay means nothing is waiting, so returning .disarm here is
+    // what actually stops the timer.
+    if (delay) |ms| t.scheduleAnimationDelay(ms);
+
+    // Only wake the renderer if pixels actually changed. This goes through
+    // the normal wakeup so the frame is rebuilt and drawn as usual.
+    if (dirtied) t.wakeup.notify() catch |err| {
+        log.warn("error waking up for animation err={}", .{err});
+    };
 
     return .disarm;
 }
