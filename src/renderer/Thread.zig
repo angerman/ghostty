@@ -730,6 +730,41 @@ fn scheduleAnimationDelay(self: *Thread, delay_ms: u64) void {
     );
 }
 
+/// What syncAnimationTimer should do with the animation timer, given what
+/// the last updateFrame found and what the timer is already doing.
+///
+/// Pulled out as a pure function because it is the whole point of the
+/// once-per-frame timer work and the only part of it that can be tested
+/// without a live event loop: the xev completion plumbing below is
+/// exercised only by end-to-end runs.
+const RearmAction = enum { rearm, skip, cancel, none };
+
+fn animRearmAction(
+    /// The relative delay updateFrame computed, or null if nothing is due.
+    delay_ms: ?u64,
+    /// Whether the timer is currently armed.
+    timer_active: bool,
+    /// The deadline it is armed for, if any.
+    armed_due: ?u64,
+    /// The deadline updateFrame wants, if any.
+    next_due: ?u64,
+) RearmAction {
+    if (delay_ms != null) {
+        // An update that changed pixels but not the schedule leaves the
+        // deadline exactly where it was, and re-arming for the same
+        // moment is pure churn.
+        if (timer_active and armed_due != null and armed_due == next_due) {
+            return .skip;
+        }
+        return .rearm;
+    }
+
+    // Nothing to animate. Cancel an outstanding timer rather than letting
+    // it fire and find nothing to do; if none is armed there is nothing
+    // to do at all.
+    return if (timer_active) .cancel else .none;
+}
+
 /// Bring the animation timer in line with what the last updateFrame found:
 /// armed for the next due frame, or cancelled if nothing is animating.
 ///
@@ -737,36 +772,37 @@ fn scheduleAnimationDelay(self: *Thread, delay_ms: u64) void {
 /// that this can run without reading the image storage or its clock, both
 /// of which need the terminal state mutex.
 fn syncAnimationTimer(self: *Thread) void {
-    if (self.renderer.next_animation_delay_ms) |delay_ms| {
-        // An update that changed pixels but not the schedule leaves the
-        // deadline exactly where it was, and re-arming for the same
-        // moment is pure churn.
-        if (self.anim_c.state() == .active and
-            self.anim_armed_due_ms != null and
-            self.anim_armed_due_ms.? == self.renderer.next_animation_due_ms)
-        {
-            return;
-        }
+    switch (animRearmAction(
+        self.renderer.next_animation_delay_ms,
+        self.anim_c.state() == .active,
+        self.anim_armed_due_ms,
+        self.renderer.next_animation_due_ms,
+    )) {
+        .skip => {},
 
-        self.anim_armed_due_ms = self.renderer.next_animation_due_ms;
-        self.scheduleAnimationDelay(delay_ms);
-        return;
-    }
-    self.anim_armed_due_ms = null;
+        .rearm => {
+            self.anim_armed_due_ms = self.renderer.next_animation_due_ms;
+            self.scheduleAnimationDelay(self.renderer.next_animation_delay_ms.?);
+        },
 
-    // Nothing to animate. Cancel an outstanding timer rather than letting
-    // it fire and find nothing to do.
-    if (self.anim_c.state() == .active and
-        self.anim_c_cancel.state() == .dead)
-    {
-        self.anim_h.cancel(
-            &self.loop,
-            &self.anim_c,
-            &self.anim_c_cancel,
-            void,
-            null,
-            animCancelCallback,
-        );
+        .none => self.anim_armed_due_ms = null,
+
+        .cancel => {
+            self.anim_armed_due_ms = null;
+
+            // Only issue a cancel if one isn't already in flight, or the
+            // completion could be reused while still active.
+            if (self.anim_c_cancel.state() == .dead) {
+                self.anim_h.cancel(
+                    &self.loop,
+                    &self.anim_c,
+                    &self.anim_c_cancel,
+                    void,
+                    null,
+                    animCancelCallback,
+                );
+            }
+        },
     }
 }
 
@@ -1070,3 +1106,31 @@ const Compression = struct {
         };
     }
 };
+
+test "animRearmAction" {
+    const testing = std.testing;
+
+    // Nothing due: cancel an armed timer, otherwise do nothing.
+    try testing.expectEqual(RearmAction.cancel, animRearmAction(null, true, 500, null));
+    try testing.expectEqual(RearmAction.none, animRearmAction(null, false, null, null));
+
+    // Due and no timer armed: arm it.
+    try testing.expectEqual(RearmAction.rearm, animRearmAction(100, false, null, 600));
+
+    // Due and the timer is already armed for exactly this deadline: skip,
+    // which is the once-per-frame guard -- a pixel-only update leaves the
+    // schedule unchanged and must not churn the timer.
+    try testing.expectEqual(RearmAction.skip, animRearmAction(100, true, 600, 600));
+
+    // Due and armed, but for a different deadline (the schedule changed):
+    // re-arm to the new one.
+    try testing.expectEqual(RearmAction.rearm, animRearmAction(100, true, 600, 700));
+
+    // Due and armed, but we don't know what for yet (armed_due null): must
+    // re-arm rather than assume it matches.
+    try testing.expectEqual(RearmAction.rearm, animRearmAction(100, true, null, 600));
+
+    // Due and armed for a known deadline, but the new one is unknown: the
+    // deadlines are not equal, so re-arm.
+    try testing.expectEqual(RearmAction.rearm, animRearmAction(100, true, 600, null));
+}

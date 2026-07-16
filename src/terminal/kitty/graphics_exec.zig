@@ -1745,3 +1745,77 @@ test "kittygfx interrupted loads retain nothing" {
     // case; nothing else grew, and no load is retained.
     try testing.expect(storage.total_bytes >= bytes_before);
 }
+
+test "kittygfx invalidation domains per command" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    try testTransmitImage(alloc, &t, 1);
+
+    const storage = &t.screens.active.kitty_images;
+
+    // Place and draw the image, so the animation is scheduled and edits
+    // to the current frame count as visible.
+    try testExec(alloc, &t, "a=p,i=1");
+    storage.images.getPtr(1).?.drawn = true;
+
+    const Domains = struct { layout: bool, pixel: bool, schedule: bool };
+    const clear = struct {
+        fn f(s: *ImageStorage) void {
+            s.layout_dirty = false;
+            s.pixel_dirty = false;
+            s.schedule_dirty = false;
+        }
+    }.f;
+    const domains = struct {
+        fn f(s: *const ImageStorage) Domains {
+            return .{
+                .layout = s.layout_dirty,
+                .pixel = s.pixel_dirty,
+                .schedule = s.schedule_dirty,
+            };
+        }
+    }.f;
+
+    // A new frame that is not the current one is a stored-only change: it
+    // costs nothing until it is displayed, so no domain is invalidated.
+    clear(storage);
+    try testExec(alloc, &t, "a=f,i=1,f=32,s=2,v=2;/////////////////////w==");
+    try testing.expectEqual(Domains{ .layout = false, .pixel = false, .schedule = false }, domains(storage));
+
+    // Editing the current (root) frame changes the pixels on screen and
+    // restarts its gap interval: pixel and schedule, never layout.
+    clear(storage);
+    try testExec(alloc, &t, "a=f,i=1,f=32,s=2,v=2,r=1,X=1;AAAAAAAAAAAAAAAAAAAAAA==");
+    try testing.expectEqual(Domains{ .layout = false, .pixel = true, .schedule = true }, domains(storage));
+
+    // Editing a non-current frame is stored-only again.
+    clear(storage);
+    try testExec(alloc, &t, "a=f,i=1,f=32,s=2,v=2,r=2,X=1;/////////////////////w==");
+    try testing.expectEqual(Domains{ .layout = false, .pixel = false, .schedule = false }, domains(storage));
+
+    // An animation control that only changes playback state reschedules
+    // and nothing else.
+    clear(storage);
+    try testExec(alloc, &t, "a=a,i=1,s=3");
+    try testing.expectEqual(Domains{ .layout = false, .pixel = false, .schedule = true }, domains(storage));
+
+    // Switching the current frame changes the pixels on screen too.
+    clear(storage);
+    try testExec(alloc, &t, "a=a,i=1,c=2");
+    try testing.expectEqual(Domains{ .layout = false, .pixel = true, .schedule = true }, domains(storage));
+
+    // Composing into the current frame (now frame 2) is a pixel change.
+    clear(storage);
+    try testExec(alloc, &t, "a=c,i=1,r=2,c=2,w=1,h=1,x=1,C=1");
+    try testing.expectEqual(Domains{ .layout = false, .pixel = true, .schedule = true }, domains(storage));
+
+    // Deleting a frame changes the frame set: pixel iff what's rendered
+    // changed, schedule always, never layout.
+    clear(storage);
+    try testExec(alloc, &t, "a=d,d=f,i=1,r=2");
+    try testing.expect(!storage.layout_dirty);
+    try testing.expect(storage.schedule_dirty);
+}

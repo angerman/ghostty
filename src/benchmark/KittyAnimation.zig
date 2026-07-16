@@ -12,6 +12,16 @@
 //! placements, matches at the end of iteration order -- because the
 //! interesting question is not the happy path but whether the scan degrades
 //! with things that have nothing to do with the animation.
+//!
+//! Note the ingestion and tick modes *are* the terminal-state-mutex hold
+//! times for those operations: command execution runs the whole of
+//! addAnimationFrame / animationTick while the exec path holds that mutex
+//! (Terminal.kittyGraphics is called under it, and the renderer ticks via
+//! lockDemand). So `ingest-edit` is the lock-held compose+commit cost and
+//! `tick-advance` is the lock-held tick cost, measured directly. The two
+//! under-lock costs not covered here are decode (identical to ordinary
+//! image decode, not animation-specific) and the renderer snapshot (which
+//! needs a real renderer instance and so a GPU).
 const KittyAnimation = @This();
 
 const std = @import("std");
