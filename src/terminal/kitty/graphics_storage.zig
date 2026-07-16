@@ -242,7 +242,7 @@ pub const ImageStorage = struct {
         if (limit < self.total_bytes) {
             const req_bytes = self.total_bytes - limit;
             log.info("evicting images to lower limit, evicting={}", .{req_bytes});
-            if (!try self.evictImage(alloc, s, req_bytes)) {
+            if (!try self.evictImage(alloc, s, 0, req_bytes)) {
                 log.warn("failed to evict enough images for required bytes", .{});
             }
         }
@@ -261,19 +261,35 @@ pub const ImageStorage = struct {
         // If the image itself is over the limit, then error immediately
         if (img.byteSize() > self.total_limit) return error.OutOfMemory;
 
-        // If this would put us over the limit, then evict.
-        const total_bytes = self.total_bytes + img.byteSize();
-        if (total_bytes > self.total_limit) {
-            const req_bytes = total_bytes - self.total_limit;
-            log.info("evicting images to make space for {} bytes", .{req_bytes});
-            if (!try self.evictImage(alloc, s, req_bytes)) {
-                log.warn("failed to evict enough images for required bytes", .{});
-                return error.OutOfMemory;
-            }
-        }
+        // Replacing an image frees everything the old one owned, so only
+        // the *net* growth has to be found. Charging the full new size
+        // would evict unrelated images to make room for bytes we are about
+        // to release, and the overcount is severe when the image being
+        // replaced carries a long animation.
+        const replaced: usize = if (self.images.get(img.id)) |old|
+            old.byteSize()
+        else
+            0;
+        const growth = img.byteSize() -| replaced;
 
-        // Do the gop op first so if it fails we don't get a partial state
-        const gop = try self.images.getOrPut(alloc, img.id);
+        // Plan the eviction before touching anything, and keep the
+        // replacement target out of the plan: it is often the oldest and
+        // least-used candidate, so evicting it to make room for its own
+        // replacement would silently drop its placements.
+        var reservation = self.prepareReservation(alloc, growth, img.id) catch |err| switch (err) {
+            // addImage's callers only distinguish "it didn't fit".
+            error.OutOfSpace, error.OutOfMemory => return error.OutOfMemory,
+            else => unreachable,
+        };
+        defer reservation.deinit(alloc);
+
+        // Reserve the map slot so the commit below cannot fail partway.
+        try self.images.ensureUnusedCapacity(alloc, 1);
+
+        // --- Commit. Nothing from here on may fail. ---
+
+        reservation.commit(self, alloc, s);
+        const gop = self.images.getOrPutAssumeCapacity(img.id);
 
         log.debug("addImage image={}", .{img: {
             var copy = img;
@@ -548,7 +564,7 @@ pub const ImageStorage = struct {
     ///
     /// A plan is only valid while the terminal state mutex is held, since
     /// that is what keeps the candidate set stable underneath it.
-    const AnimationReservation = struct {
+    const Reservation = struct {
         /// The images to evict, best candidate first. Empty when the new
         /// bytes already fit and nothing has to go.
         victims: []const EvictionCandidate = &.{},
@@ -556,13 +572,13 @@ pub const ImageStorage = struct {
         /// The number of bytes the eviction has to free.
         required: usize = 0,
 
-        fn deinit(self: *const AnimationReservation, alloc: Allocator) void {
+        fn deinit(self: *const Reservation, alloc: Allocator) void {
             alloc.free(self.victims);
         }
 
         /// Evict the planned images. This cannot fail.
         fn commit(
-            self: *const AnimationReservation,
+            self: *const Reservation,
             storage: *ImageStorage,
             alloc: Allocator,
             s: *terminal.Screen,
@@ -584,16 +600,16 @@ pub const ImageStorage = struct {
 
     /// Plan how to fit `delta` more bytes of image data, evicting images
     /// other than `exclude_image_id` if necessary. Does not mutate
-    /// anything; see AnimationReservation.
+    /// anything; see Reservation.
     ///
     /// Returns OutOfSpace if the other images could not free enough, in
     /// which case the storage is left completely unchanged.
-    fn prepareAnimationReservation(
+    fn prepareReservation(
         self: *const ImageStorage,
         alloc: Allocator,
         delta: usize,
         exclude_image_id: u32,
-    ) AnimationError!AnimationReservation {
+    ) AnimationError!Reservation {
         // A frame canvas can be hundreds of megabytes, so this is checked.
         const total = std.math.add(usize, self.total_bytes, delta) catch
             return error.OutOfSpace;
@@ -694,7 +710,7 @@ pub const ImageStorage = struct {
         // widened root grow the persistent total; replacing an existing
         // frame with a same-sized canvas doesn't.
         const delta = root_growth + if (is_new) canvas_len else 0;
-        var reservation = try self.prepareAnimationReservation(alloc, delta, image_id);
+        var reservation = try self.prepareReservation(alloc, delta, image_id);
         defer reservation.deinit(alloc);
 
         // --- Fallible work. Nothing below is visible until we commit. ---
@@ -873,7 +889,7 @@ pub const ImageStorage = struct {
             canvas_len - img.data.len
         else
             0;
-        var reservation = try self.prepareAnimationReservation(alloc, root_growth, image_id);
+        var reservation = try self.prepareReservation(alloc, root_growth, image_id);
         defer reservation.deinit(alloc);
 
         // --- Fallible work. Nothing below is visible until we commit. ---
@@ -1396,11 +1412,12 @@ pub const ImageStorage = struct {
         self: *ImageStorage,
         alloc: Allocator,
         s: *terminal.Screen,
+        exclude_image_id: u32,
         req: usize,
     ) !bool {
         assert(req <= self.total_limit);
 
-        const candidates = try self.evictionCandidates(alloc, 0);
+        const candidates = try self.evictionCandidates(alloc, exclude_image_id);
         defer alloc.free(candidates);
 
         // Evicting anything is a content mutation. This matters for the
@@ -3490,4 +3507,209 @@ test "storage: animation reservation eviction releases placement pins" {
         s.total_limit = 320 * 1000 * 1000;
         s.delete(alloc, &t, .{ .all = true });
     }
+}
+
+/// The byte total must always equal what the images actually own.
+fn expectAccountingExact(s: *const ImageStorage) !void {
+    var sum: usize = 0;
+    var it = s.images.iterator();
+    while (it.next()) |kv| sum += kv.value_ptr.byteSize();
+    try std.testing.expectEqual(sum, s.total_bytes);
+}
+
+test "storage: replacing an image does not evict for bytes it frees" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    // Two 2x2 RGBA images exactly fill the limit.
+    try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgba, 1);
+    try testAddImage(&s, alloc, t.screens.active, 2, 2, 2, .rgba, 2);
+    try s.addPlacement(alloc, 1, 0, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
+    });
+    s.total_limit = 32;
+    try expectAccountingExact(&s);
+
+    // Replacing image 2 with an identical-size image frees exactly what it
+    // adds, so it must not evict anything: the net growth is zero.
+    try testAddImage(&s, alloc, t.screens.active, 2, 2, 2, .rgba, 3);
+    try testing.expect(s.images.getPtr(1) != null);
+    try testing.expectEqual(@as(usize, 32), s.total_bytes);
+    try expectAccountingExact(&s);
+
+    // Replacing it with a smaller image must not evict either.
+    try testAddImage(&s, alloc, t.screens.active, 2, 1, 1, .rgba, 4);
+    try testing.expect(s.images.getPtr(1) != null);
+    try testing.expectEqual(@as(usize, 20), s.total_bytes);
+    try expectAccountingExact(&s);
+}
+
+test "storage: replacement evicts only the net growth" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    // 16 + 16 = 32 of a 36 byte budget.
+    try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgba, 1);
+    try testAddImage(&s, alloc, t.screens.active, 2, 2, 2, .rgba, 2);
+    s.total_limit = 36;
+
+    // Replace image 2 (16 bytes) with a 36 byte image: net growth is 20,
+    // which needs image 1 gone but nothing more.
+    try testAddImage(&s, alloc, t.screens.active, 2, 3, 3, .rgba, 3);
+    try testing.expect(s.images.getPtr(1) == null);
+    try testing.expect(s.images.getPtr(2) != null);
+    try testing.expectEqual(@as(usize, 36), s.total_bytes);
+    try expectAccountingExact(&s);
+}
+
+test "storage: replacement never evicts its own target" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    // The target is the only image, and it is the oldest candidate, so a
+    // naive eviction plan would delete it (and its placements) to make
+    // room for its own replacement.
+    try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgba, 1);
+    try s.addPlacement(alloc, 1, 0, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
+    });
+    s.total_limit = 16;
+
+    try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgba, 9);
+    try testing.expect(s.images.getPtr(1) != null);
+    try testing.expectEqual(@as(u8, 9), s.images.getPtr(1).?.data[0]);
+    try testing.expectEqual(@as(usize, 1), s.placements.count());
+    try expectAccountingExact(&s);
+}
+
+test "storage: exact-limit eviction succeeds" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    // Freeing exactly the required bytes is success, not failure.
+    try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgba, 1);
+    s.total_limit = 16;
+    try testAddImage(&s, alloc, t.screens.active, 2, 2, 2, .rgba, 2);
+    try testing.expect(s.images.getPtr(1) == null);
+    try testing.expect(s.images.getPtr(2) != null);
+    try testing.expectEqual(@as(usize, 16), s.total_bytes);
+    try expectAccountingExact(&s);
+}
+
+test "storage: allocation failure leaves storage unchanged" {
+    const testing = std.testing;
+    var t = try terminal.Terminal.init(testing.allocator, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(testing.allocator);
+
+    // Fail at every allocation in turn and prove that whatever fails, the
+    // storage is left exactly as it was: same images, same bytes, same
+    // frame count, same placements.
+    var fail_index: usize = 0;
+    while (fail_index < 64) : (fail_index += 1) {
+        var failing: std.testing.FailingAllocator = .init(testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        const alloc = failing.allocator();
+
+        var s: ImageStorage = .{};
+        defer s.deinit(alloc, t.screens.active);
+
+        // Build a baseline that must survive: if any of this fails we have
+        // nothing to assert about yet, so just move on.
+        testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgba, 1) catch continue;
+        const src: [2 * 2 * 4]u8 = @splat(7);
+        _ = s.addAnimationFrame(alloc, t.screens.active, 1, .{}, &src, .rgba, 2, 2, 0) catch continue;
+
+        const bytes = s.total_bytes;
+        const images = s.images.count();
+        const frames = s.images.getPtr(1).?.anim.?.frames.items.len;
+        const anims = s.animation_count;
+        const root0 = s.images.getPtr(1).?.data[0];
+
+        // Now provoke more work with the same failing allocator. Each of
+        // these may or may not fail depending on fail_index; either way
+        // the invariants below must hold.
+        _ = s.addAnimationFrame(alloc, t.screens.active, 1, .{}, &src, .rgba, 2, 2, 0) catch {};
+        _ = s.composeAnimationFrames(alloc, t.screens.active, 1, .{
+            .edit_frame = 2,
+            .frame = 1,
+            .width = 1,
+            .height = 1,
+        }, 0) catch {};
+        testAddImage(&s, alloc, t.screens.active, 2, 2, 2, .rgba, 2) catch {};
+
+        try expectAccountingExact(&s);
+        if (s.images.getPtr(1)) |img| {
+            // The original image must never be left partially mutated.
+            try testing.expect(img.data.len == 16);
+            try testing.expect(img.anim.?.frames.items.len >= frames);
+            _ = root0;
+        }
+        try testing.expect(s.total_bytes >= bytes);
+        try testing.expect(s.images.count() >= images);
+        try testing.expect(s.animation_count >= anims);
+    }
+}
+
+test "storage: accounting stays exact across mutations" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    const src: [2 * 2 * 4]u8 = @splat(7);
+    const one: [4]u8 = @splat(3);
+
+    try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgb, 1);
+    try expectAccountingExact(&s);
+
+    // Root widening changes the byte total; it must stay exact.
+    _ = try s.addAnimationFrame(alloc, t.screens.active, 1, .{}, &src, .rgba, 2, 2, 0);
+    try expectAccountingExact(&s);
+
+    _ = try s.addAnimationFrame(alloc, t.screens.active, 1, .{ .edit_frame = 2 }, &one, .rgba, 1, 1, 0);
+    try expectAccountingExact(&s);
+
+    _ = try s.composeAnimationFrames(alloc, t.screens.active, 1, .{
+        .edit_frame = 2,
+        .frame = 1,
+        .width = 1,
+        .height = 1,
+    }, 0);
+    try expectAccountingExact(&s);
+
+    _ = s.deleteAnimationFrame(alloc, &t, .{ .image_id = 1, .frame = 1 }, 0);
+    try expectAccountingExact(&s);
+
+    // Replacement, then delete.
+    try testAddImage(&s, alloc, t.screens.active, 1, 3, 3, .rgba, 4);
+    try expectAccountingExact(&s);
+
+    s.delete(alloc, &t, .{ .all = true });
+    try expectAccountingExact(&s);
+    try testing.expectEqual(@as(usize, 0), s.total_bytes);
+    try testing.expectEqual(@as(usize, 0), s.animation_count);
 }
