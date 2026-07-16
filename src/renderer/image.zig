@@ -62,7 +62,7 @@ pub const State = struct {
     pub fn deinit(self: *State, alloc: Allocator) void {
         {
             var it = self.images.iterator();
-            while (it.next()) |kv| kv.value_ptr.image.deinit(alloc);
+            while (it.next()) |kv| kv.value_ptr.deinit(alloc);
             self.images.deinit(alloc);
         }
         self.kitty_placements.deinit(alloc);
@@ -86,7 +86,7 @@ pub const State = struct {
         while (image_it.next()) |kv| {
             const img = &kv.value_ptr.image;
             if (img.isUnloading()) {
-                img.deinit(alloc);
+                kv.value_ptr.deinit(alloc);
                 self.images.removeByPtr(kv.key_ptr);
                 continue;
             }
@@ -601,41 +601,50 @@ pub const State = struct {
             return;
         }
 
-        // Copy the data so we own it.
-        const data = if (alloc.dupe(
-            u8,
-            pending.dataSlice(),
-        )) |v| v else |_| {
-            if (!gop.found_existing) {
-                // If this is a new entry we can just remove it since it
-                // was never sent to the GPU.
-                _ = self.images.remove(id);
-            } else {
-                // If this was an existing entry, it is invalid and
-                // we must unload it.
-                gop.value_ptr.image.markForUnload();
-            }
-
-            return error.OutOfMemory;
+        // Copy the pixels out of terminal state and into our own staging,
+        // because the upload happens later without the terminal lock. The
+        // staging buffer is reused across frames and only grows, so a
+        // dimension-stable animation makes no allocator call here at all
+        // after its first frame.
+        if (!gop.found_existing) gop.value_ptr.* = .{
+            .image = .{ .pending = pending },
+            .generation = 0,
+            .staging = &.{},
         };
-        // Note: we don't need to errdefer free the data because it is
-        // put into the map immediately below and our errdefer to
-        // handle our map state will fix this up.
 
-        // Store it in the map
+        const src = pending.dataSlice();
+        if (gop.value_ptr.staging.len < src.len) {
+            const grown = alloc.realloc(gop.value_ptr.staging, src.len) catch {
+                if (!gop.found_existing) {
+                    // If this is a new entry we can just remove it since it
+                    // was never sent to the GPU.
+                    _ = self.images.remove(id);
+                } else {
+                    // If this was an existing entry, it is invalid and
+                    // we must unload it.
+                    gop.value_ptr.image.markForUnload();
+                }
+
+                return error.OutOfMemory;
+            };
+            gop.value_ptr.staging = grown;
+        }
+        const data = gop.value_ptr.staging[0..src.len];
+        @memcpy(data, src);
+
+        // Store it in the map. The pending pixels are borrowed from the
+        // staging above, so nothing frees them but the entry itself.
         const new_image: Image = .{
             .pending = .{
                 .width = pending.width,
                 .height = pending.height,
                 .pixel_format = pending.pixel_format,
                 .data = data.ptr,
+                .owned = false,
             },
         };
         if (!gop.found_existing) {
-            gop.value_ptr.* = .{
-                .image = new_image,
-                .generation = 0,
-            };
+            gop.value_ptr.image = new_image;
         } else {
             gop.value_ptr.image.markForReplace(
                 alloc,
@@ -762,7 +771,9 @@ pub const Id = union(enum) {
 };
 
 /// The map used for storing images.
-pub const ImageMap = std.AutoHashMapUnmanaged(Id, struct {
+pub const ImageMap = std.AutoHashMapUnmanaged(Id, Entry);
+
+pub const Entry = struct {
     image: Image,
 
     /// The generation of the terminal image this was created from
@@ -771,7 +782,23 @@ pub const ImageMap = std.AutoHashMapUnmanaged(Id, struct {
     /// contents changed and the texture must be replaced. Zero is
     /// never a valid stored generation so it marks "not yet uploaded".
     generation: u64,
-});
+
+    /// Reusable CPU staging for this image's uploads.
+    ///
+    /// Pixels have to be copied out of terminal state before the upload,
+    /// because the upload happens without the terminal lock held. Doing
+    /// that with a fresh allocation every time means an allocate and a
+    /// free per displayed frame, forever, for buffers that are the same
+    /// size every time. So the buffer lives here instead and only grows.
+    ///
+    /// A Pending pointing into this borrows it (Pending.owned == false).
+    staging: []u8 = &.{},
+
+    pub fn deinit(self: *Entry, alloc: Allocator) void {
+        self.image.deinit(alloc);
+        if (self.staging.len > 0) alloc.free(self.staging);
+    }
+};
 
 /// The state for a single image that is to be rendered.
 pub const Image = union(enum) {
@@ -808,6 +835,16 @@ pub const Image = union(enum) {
 
         /// Data is always expected to be (width * height * bpp).
         data: [*]u8,
+
+        /// Whether `data` is owned by this Image and must be freed with
+        /// it.
+        ///
+        /// Borrowed data points into the reusable staging buffer owned by
+        /// the image's map entry, which is how a dimension-stable
+        /// animation avoids allocating and freeing a full frame every
+        /// time it advances. A format conversion allocates and takes
+        /// ownership, so this cannot be assumed either way.
+        owned: bool = true,
 
         pub fn dataSlice(self: Pending) []u8 {
             return self.data[0..self.len()];
@@ -849,10 +886,10 @@ pub const Image = union(enum) {
         switch (self) {
             .pending,
             .unload_pending,
-            => |p| alloc.free(p.dataSlice()),
+            => |p| if (p.owned) alloc.free(p.dataSlice()),
 
             .replace, .unload_replace => |r| {
-                alloc.free(r.pending.dataSlice());
+                if (r.pending.owned) alloc.free(r.pending.dataSlice());
                 r.texture.deinit();
             },
 
@@ -884,7 +921,7 @@ pub const Image = union(enum) {
 
         // If we have pending data right now, free it.
         if (self.getPending()) |p| {
-            alloc.free(p.dataSlice());
+            if (p.owned) alloc.free(p.dataSlice());
         }
         // If we have an existing texture, use it in the replace.
         if (self.getTexture()) |t| {
@@ -942,8 +979,9 @@ pub const Image = union(enum) {
             .rgba => unreachable,
             .bgra => wuffs.swizzle.bgraToRgba(alloc, data),
         };
-        alloc.free(data);
+        if (p.owned) alloc.free(data);
         p.data = rgba.ptr;
+        p.owned = true;
         p.pixel_format = .rgba;
     }
 
@@ -1000,9 +1038,11 @@ pub const Image = union(enum) {
                 errdefer comptime unreachable;
 
                 // The pixels are in the texture we already had, so only
-                // the pending copy is released. The texture identity, and
-                // anything the GPU holds referencing it, is preserved.
-                alloc.free(p.dataSlice());
+                // the pending copy is released, and only if we own it:
+                // borrowed staging stays alive for the next frame. The
+                // texture identity, and anything the GPU holds
+                // referencing it, is preserved.
+                if (p.owned) alloc.free(p.dataSlice());
                 self.* = .{ .ready = existing };
                 return;
             }
@@ -1179,4 +1219,112 @@ test "kitty: an unchanged shape reuses the texture" {
     try testing.expect(!Image.textureFits(64, 33, p));
     try testing.expect(!Image.textureFits(65, 32, p));
     try testing.expect(!Image.textureFits(0, 0, p));
+}
+
+/// Counts allocator calls so tests can assert a steady-state frame makes
+/// none, rather than asserting that the code looks like it wouldn't.
+const CountingAllocator = struct {
+    parent: Allocator,
+    allocs: usize = 0,
+    frees: usize = 0,
+    resizes: usize = 0,
+
+    fn allocator(self: *CountingAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.allocs += 1;
+        return self.parent.rawAlloc(len, a, ra);
+    }
+
+    fn resize(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.resizes += 1;
+        return self.parent.rawResize(buf, a, new_len, ra);
+    }
+
+    fn remap(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.resizes += 1;
+        return self.parent.rawRemap(buf, a, new_len, ra);
+    }
+
+    fn free(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.frees += 1;
+        self.parent.rawFree(buf, a, ra);
+    }
+};
+
+test "kitty: steady-state frames do not touch the allocator" {
+    const testing = std.testing;
+    var counting: CountingAllocator = .{ .parent = testing.allocator };
+    const alloc = counting.allocator();
+
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 100;
+
+    const storage = &t.screens.active.kitty_images;
+
+    const data = try alloc.alloc(u8, 4 * 4 * 4);
+    @memset(data, 1);
+    {
+        errdefer alloc.free(data);
+        try storage.addImage(alloc, t.screens.active, .{
+            .id = 1,
+            .width = 4,
+            .height = 4,
+            .format = .rgba,
+            .data = data,
+        });
+    }
+    const pin = try t.screens.active.pages.trackPin(
+        t.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
+    );
+    try storage.addPlacement(alloc, 1, 0, .{ .location = .{ .pin = pin } });
+
+    // Two frames so the animation has something to alternate between.
+    const src: [4 * 4 * 4]u8 = @splat(9);
+    _ = try storage.addAnimationFrame(alloc, t.screens.active, 1, .{}, &src, .rgba, 4, 4, 0);
+    const anim = storage.images.getPtr(1).?.anim.?;
+    anim.state = .running;
+    anim.setGap(0, 100);
+    anim.setGap(1, 100);
+
+    var state: State = .empty;
+    defer state.deinit(alloc);
+
+    // Warm up: the first synchronization is allowed to allocate.
+    state.kittyUpdatePlacements(alloc, &t, .{ .width = 10, .height = 10 });
+
+    // Now the steady state. Advancing a frame and synchronizing its
+    // pixels must not allocate, free, or resize anything: the staging
+    // buffer is reused and the placements are untouched.
+    var now: u64 = 100;
+    for (0..16) |_| {
+        _ = storage.animationTick(now);
+        state.kittyUpdatePixels(alloc, &t);
+        now += 100;
+    }
+
+    const allocs = counting.allocs;
+    const frees = counting.frees;
+    const resizes = counting.resizes;
+    for (0..16) |_| {
+        _ = storage.animationTick(now);
+        state.kittyUpdatePixels(alloc, &t);
+        now += 100;
+    }
+    try testing.expectEqual(allocs, counting.allocs);
+    try testing.expectEqual(frees, counting.frees);
+    try testing.expectEqual(resizes, counting.resizes);
 }
