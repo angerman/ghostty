@@ -539,6 +539,42 @@ pub const ImageStorage = struct {
         return next;
     }
 
+    /// The RGBA canvas size of an image, with checked arithmetic.
+    ///
+    /// Dimensions are already bounded when an image is loaded, but the
+    /// product is computed on every frame operation and a wrap here would
+    /// undersize a buffer that pixel loops then run past.
+    fn canvasLen(width: u32, height: u32) error{OutOfSpace}!usize {
+        const px = std.math.mul(usize, width, height) catch return error.OutOfSpace;
+        return std.math.mul(usize, px, 4) catch return error.OutOfSpace;
+    }
+
+    /// The most transient memory one frame operation may allocate on top of
+    /// what it persists.
+    ///
+    /// The persistent quota alone is not enough protection. A transactional
+    /// edit composes into a fresh canvas (and sometimes a freshly widened
+    /// root) before swapping it in, so it can allocate two full canvases
+    /// while its *persistent* delta is zero -- nothing else would bound it,
+    /// and peak RSS could reach several times the nominal quota. Deriving
+    /// the transient bound from the persistent limit means configuring one
+    /// configures both.
+    fn transientLimit(self: *const ImageStorage) usize {
+        return self.total_limit;
+    }
+
+    /// Reject an operation whose transient allocations would exceed the
+    /// transient budget, before any of them are made.
+    fn checkTransient(self: *const ImageStorage, bytes: usize) AnimationError!void {
+        if (bytes > self.transientLimit()) {
+            log.warn("kitty animation operation needs {} transient bytes, limit is {}", .{
+                bytes,
+                self.transientLimit(),
+            });
+            return error.OutOfSpace;
+        }
+    }
+
     /// Errors from the animation frame operations below. graphics_exec.zig
     /// maps these onto the protocol's error responses.
     pub const AnimationError = error{
@@ -683,7 +719,7 @@ pub const ImageStorage = struct {
             return error.InvalidRect;
         }
 
-        const canvas_len: usize = @as(usize, img.width) * img.height * 4;
+        const canvas_len = try canvasLen(img.width, img.height);
         const frame_count: u32 = @intCast(if (img.anim) |a| a.frameCount() else 1);
 
         // Kitty clamps an out-of-range or absent "r" to one past the last
@@ -706,10 +742,26 @@ pub const ImageStorage = struct {
         const need_root = img.format != .rgba or root_is_target;
         const root_growth: usize = if (need_root) canvas_len - img.data.len else 0;
 
+        // Preflight the transient cost before allocating any of it: the
+        // widened root and the composed canvas are both held at once, and
+        // an edit's persistent delta is zero so the quota below would not
+        // bound them. The transmitted rectangle is only copied when it
+        // needs widening.
+        const rect_rgba: usize = if (animation.formatIsOpaque(src_format) or src_format != .rgba)
+            try canvasLen(rect_width, rect_height)
+        else
+            0;
+        const new_root_len: usize = if (need_root) canvas_len else 0;
+        const target_len: usize = if (root_is_target) 0 else canvas_len;
+        try self.checkTransient(std.math.add(usize, new_root_len, target_len) catch
+            return error.OutOfSpace);
+        try self.checkTransient(rect_rgba);
+
         // Reserve space before touching anything. Only a new frame and a
         // widened root grow the persistent total; replacing an existing
         // frame with a same-sized canvas doesn't.
-        const delta = root_growth + if (is_new) canvas_len else 0;
+        const delta = std.math.add(usize, root_growth, if (is_new) canvas_len else 0) catch
+            return error.OutOfSpace;
         var reservation = try self.prepareReservation(alloc, delta, image_id);
         defer reservation.deinit(alloc);
 
@@ -754,19 +806,30 @@ pub const ImageStorage = struct {
         };
         errdefer if (!root_is_target) alloc.free(target);
 
-        // Widen the transmitted rectangle and compose it.
-        const src_rgba = try animation.allocRGBA(alloc, src, src_format);
-        defer alloc.free(src_rgba);
+        // View the transmitted rectangle as RGBA and compose it. Data
+        // that already is RGBA is borrowed rather than duplicated, which
+        // is every frame of a client streaming RGBA video.
+        const src_rgba = try animation.rgbaView(alloc, src, src_format);
+        defer src_rgba.deinit(alloc);
+
+        // A source that cannot be translucent composes identically under
+        // alpha blending and overwrite, so take the row-copy path. Kitty
+        // makes the same call (`is_opaque = data_fmt == RGB`).
+        const mode: command.CompositionMode = if (animation.formatIsOpaque(src_format))
+            .overwrite
+        else
+            params.composition_mode;
+
         animation.composeTransmitted(
             target,
             img.width,
             img.height,
-            src_rgba,
+            src_rgba.data,
             rect_width,
             rect_height,
             params.x,
             params.y,
-            params.composition_mode,
+            mode,
         );
 
         const anim_is_new = img.anim == null;
@@ -877,7 +940,7 @@ pub const ImageStorage = struct {
             return error.InvalidRect;
         }
 
-        const canvas_len: usize = @as(usize, img.width) * img.height * 4;
+        const canvas_len = try canvasLen(img.width, img.height);
 
         // As in addAnimationFrame, all composition is RGBA-on-RGBA, and
         // the destination is composed as a fresh buffer so that a failure
@@ -889,6 +952,13 @@ pub const ImageStorage = struct {
             canvas_len - img.data.len
         else
             0;
+        // Preflight the transient cost, as in addAnimationFrame.
+        try self.checkTransient(std.math.add(
+            usize,
+            if (need_root) canvas_len else 0,
+            if (root_is_target) 0 else canvas_len,
+        ) catch return error.OutOfSpace);
+
         var reservation = try self.prepareReservation(alloc, root_growth, image_id);
         defer reservation.deinit(alloc);
 
@@ -3712,4 +3782,192 @@ test "storage: accounting stays exact across mutations" {
     try expectAccountingExact(&s);
     try testing.expectEqual(@as(usize, 0), s.total_bytes);
     try testing.expectEqual(@as(usize, 0), s.animation_count);
+}
+
+/// An allocator that records the peak live bytes it handed out, so tests
+/// can assert an operation's transient cost rather than trusting the code.
+const PeakAllocator = struct {
+    parent: Allocator,
+    live: usize = 0,
+    peak: usize = 0,
+
+    fn allocator(self: *PeakAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.parent.rawAlloc(len, a, ra) orelse return null;
+        self.live += len;
+        self.peak = @max(self.peak, self.live);
+        return p;
+    }
+
+    fn resize(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.parent.rawResize(buf, a, new_len, ra)) return false;
+        self.live = self.live - buf.len + new_len;
+        self.peak = @max(self.peak, self.live);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        const p = self.parent.rawRemap(buf, a, new_len, ra) orelse return null;
+        self.live = self.live - buf.len + new_len;
+        self.peak = @max(self.peak, self.live);
+        return p;
+    }
+
+    fn free(ctx: *anyopaque, buf: []u8, a: std.mem.Alignment, ra: usize) void {
+        const self: *PeakAllocator = @ptrCast(@alignCast(ctx));
+        self.parent.rawFree(buf, a, ra);
+        self.live -= buf.len;
+    }
+};
+
+test "storage: frame ingestion transient peak is bounded" {
+    const testing = std.testing;
+    var t = try terminal.Terminal.init(testing.allocator, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(testing.allocator);
+
+    var peak: PeakAllocator = .{ .parent = testing.allocator };
+    const alloc = peak.allocator();
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    const dim = 64;
+    const canvas = dim * dim * 4;
+    try testAddImage(&s, alloc, t.screens.active, 1, dim, dim, .rgba, 0);
+
+    const src = try testing.allocator.alloc(u8, canvas);
+    defer testing.allocator.free(src);
+    @memset(src, 0x40);
+
+    // Appending a frame: the resident image and the new frame are both
+    // persistent, so the transient part on top is what matters. An RGBA
+    // source is borrowed rather than copied, so a single canvas covers it.
+    const before = peak.live;
+    peak.peak = peak.live;
+    _ = try s.addAnimationFrame(alloc, t.screens.active, 1, .{}, src, .rgba, dim, dim, 0);
+    const append_transient = peak.peak - before;
+    try testing.expect(append_transient <= 2 * canvas);
+
+    // Editing the current (root) frame: one widened/copied canvas, and
+    // again no copy of the RGBA source.
+    peak.peak = peak.live;
+    const live_before_edit = peak.live;
+    _ = try s.addAnimationFrame(
+        alloc,
+        t.screens.active,
+        1,
+        .{ .edit_frame = 1 },
+        src,
+        .rgba,
+        dim,
+        dim,
+        0,
+    );
+    try testing.expect(peak.peak - live_before_edit <= 2 * canvas);
+
+    // An RGB source must widen, which is one rect-sized copy on top.
+    const rgb = try testing.allocator.alloc(u8, dim * dim * 3);
+    defer testing.allocator.free(rgb);
+    @memset(rgb, 0x20);
+    peak.peak = peak.live;
+    const live_before_rgb = peak.live;
+    _ = try s.addAnimationFrame(alloc, t.screens.active, 1, .{}, rgb, .rgb, dim, dim, 0);
+    try testing.expect(peak.peak - live_before_rgb <= 3 * canvas);
+}
+
+test "storage: transient budget rejects oversized operations" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+    try testAddImage(&s, alloc, t.screens.active, 1, 8, 8, .rgba, 1);
+
+    // An edit persists nothing, so only the transient budget can stop it
+    // from allocating canvases far larger than the quota.
+    const bytes_before = s.total_bytes;
+    s.total_limit = 64;
+
+    const src: [4]u8 = @splat(9);
+    try testing.expectError(error.OutOfSpace, s.addAnimationFrame(
+        alloc,
+        t.screens.active,
+        1,
+        .{ .edit_frame = 1 },
+        &src,
+        .rgba,
+        1,
+        1,
+        0,
+    ));
+    try testing.expectError(error.OutOfSpace, s.composeAnimationFrames(alloc, t.screens.active, 1, .{
+        .edit_frame = 1,
+        .frame = 1,
+        .width = 1,
+        .height = 1,
+        .left_edge = 1,
+    }, 0));
+
+    // Rejected before allocating: nothing moved.
+    try testing.expectEqual(bytes_before, s.total_bytes);
+    try testing.expect(s.images.getPtr(1).?.anim == null);
+    try expectAccountingExact(&s);
+}
+
+test "storage: malformed dimensions do not wrap" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    // An image whose dimensions multiply past usize must be refused by the
+    // checked size math rather than wrapping into a small allocation that
+    // the pixel loops then run off the end of. Such an image can only
+    // exist if it was never validated on the way in, so build it directly.
+    try s.images.put(alloc, 1, .{
+        .id = 1,
+        .width = std.math.maxInt(u32),
+        .height = std.math.maxInt(u32),
+        .format = .rgba,
+        .data = "",
+    });
+    defer _ = s.images.remove(1);
+
+    const src: [4]u8 = @splat(1);
+    try testing.expectError(error.OutOfSpace, s.addAnimationFrame(
+        alloc,
+        t.screens.active,
+        1,
+        .{},
+        &src,
+        .rgba,
+        1,
+        1,
+        0,
+    ));
+    // Disjoint rectangles, so this gets past the overlap check and
+    // actually reaches the size arithmetic.
+    try testing.expectError(error.OutOfSpace, s.composeAnimationFrames(alloc, t.screens.active, 1, .{
+        .edit_frame = 1,
+        .frame = 1,
+        .width = 1,
+        .height = 1,
+        .left_edge = 1,
+    }, 0));
 }

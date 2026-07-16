@@ -326,6 +326,49 @@ pub fn composeFrames(
     }
 }
 
+/// Pixels that are either borrowed from the caller or owned by us.
+///
+/// Widening to RGBA costs a full copy, but data that is *already* RGBA
+/// needs none: composition reads it and never retains it. Making the
+/// distinction explicit is what lets the common case (a client streaming
+/// RGBA frames) avoid duplicating every frame it sends, while keeping the
+/// caller's cleanup honest either way.
+pub const Pixels = struct {
+    data: []const u8,
+    owned: bool,
+
+    pub fn deinit(self: Pixels, alloc: Allocator) void {
+        if (self.owned) alloc.free(@constCast(self.data));
+    }
+};
+
+/// An RGBA view of a pixel buffer, borrowing it when it already is RGBA
+/// and widening it into an owned buffer otherwise.
+///
+/// Only valid for as long as `data` is: this is for reading during a
+/// composition, not for storing.
+pub fn rgbaView(
+    alloc: Allocator,
+    data: []const u8,
+    format: Format,
+) Allocator.Error!Pixels {
+    if (format == .rgba) return .{ .data = data, .owned = false };
+    return .{ .data = try allocRGBA(alloc, data, format), .owned = true };
+}
+
+/// True if pixels in this format are always fully opaque.
+///
+/// Alpha-compositing a fully opaque source is exactly overwrite, so this
+/// lets the row-copy path take frames the client sent without alpha.
+/// Kitty makes the same distinction (`is_opaque = data_fmt == RGB`).
+pub fn formatIsOpaque(format: Format) bool {
+    return switch (format) {
+        .rgb, .gray => true,
+        .rgba, .gray_alpha => false,
+        .png => false,
+    };
+}
+
 /// Allocate an RGBA copy of a pixel buffer in any of the stored formats.
 ///
 /// Composition is always RGBA-on-RGBA, so both the root frame and every
