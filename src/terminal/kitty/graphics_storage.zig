@@ -493,7 +493,7 @@ pub const ImageStorage = struct {
     /// True if this image's animation could show a new frame at some
     /// point. This is Kitty's animatable check, and the reasons to say no
     /// are all cheap to test.
-    fn animatable(self: *const ImageStorage, img: *const Image) bool {
+    fn animatable(_: *const ImageStorage, img: *const Image) bool {
         const anim = img.anim orelse return false;
         if (anim.state == .stopped) return false;
 
@@ -507,16 +507,22 @@ pub const ImageStorage = struct {
         // The animation has played out its loops.
         if (anim.max_loops != 0 and anim.current_loop >= anim.max_loops) return false;
 
-        // Kitty tracks whether an image is actually drawn; we approximate
-        // that with "has any placement at all". An image whose only
-        // placement has scrolled off into the scrollback therefore keeps
-        // ticking. See the v1 notes in graphics.zig.
-        var it = self.placements.iterator();
-        while (it.next()) |kv| {
-            if (kv.key_ptr.image_id == img.id) return true;
-        }
+        // Only what the renderer actually draws is scheduled. This is a
+        // field read, so the scan costs O(animated images) rather than
+        // O(animated images x placements), and an image that is stored but
+        // off screen keeps no timer armed and wakes nobody.
+        return img.drawn;
+    }
 
-        return false;
+    /// Record which images the renderer draws.
+    ///
+    /// Called by the renderer during layout synchronization while it holds
+    /// the terminal state lock. Scheduling reads the result, so an image
+    /// that scrolls out of the viewport stops being scheduled at the next
+    /// settling layout update, and one that scrolls back in resumes.
+    pub fn setDrawn(self: *ImageStorage, drawn: anytype) void {
+        var it = self.images.iterator();
+        while (it.next()) |kv| kv.value_ptr.drawn = drawn.contains(kv.key_ptr.*);
     }
 
     /// Advance any animations that are due, and report when the next one
@@ -3280,6 +3286,10 @@ fn testAddPlayableImage(
         .location = .{ .pin = try trackPin(t, .{ .x = 0, .y = 0 }) },
     });
 
+    // Stand in for the renderer: only what is actually drawn is
+    // scheduled, and there is no renderer in these tests.
+    s.images.getPtr(id).?.drawn = true;
+
     const anim = s.images.getPtr(id).?.anim.?;
     anim.state = .running;
     anim.setGap(0, 100);
@@ -3330,7 +3340,7 @@ test "storage: animation tick advances on schedule" {
     }
 }
 
-test "storage: animation tick is dormant without a placement" {
+test "storage: animation tick is dormant when not drawn" {
     const testing = std.testing;
     const alloc = testing.allocator;
     var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
@@ -3339,11 +3349,18 @@ test "storage: animation tick is dormant without a placement" {
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
 
-    // Same as a playable image but with no placement.
+    // A playable animation that the renderer does not draw: it may be
+    // scrolled into the scrollback, on an inactive screen, or a virtual
+    // placement with no placeholder in the viewport. Being in storage is
+    // not being visible, so none of it may be scheduled.
     try testAddAnimatedImage(&s, alloc, t.screens.active, 1, 1);
+    try s.addPlacement(alloc, 1, 0, .{
+        .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
+    });
     const anim = s.images.getPtr(1).?.anim.?;
     anim.state = .running;
     anim.setGap(0, 100);
+    try testing.expect(!s.images.getPtr(1).?.drawn);
 
     const r = s.animationTick(10_000);
     try testing.expect(!r.dirtied);

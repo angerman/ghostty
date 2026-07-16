@@ -579,6 +579,20 @@ pub const Image = struct {
     /// state; all *mutation* must go through ImageStorage.images.getPtr.
     anim: ?*Animation = null,
 
+    /// Whether the renderer actually draws this image right now.
+    ///
+    /// Maintained by the renderer during layout synchronization, because
+    /// only the renderer knows what is on screen: being present in storage
+    /// is not being visible. An image whose only placement sits in
+    /// scrollback, or a virtual placement with no placeholder in the
+    /// viewport, is stored but not drawn.
+    ///
+    /// Animation scheduling reads this so that nothing off screen keeps a
+    /// timer armed or wakes the renderer, and so that the scheduling scan
+    /// costs one field read per animated image rather than a walk of every
+    /// placement.
+    drawn: bool = false,
+
     /// Unique, monotonically increasing stamp assigned each time an
     /// image is added to (or replaced in) an ImageStorage. A changed
     /// generation for a given image ID means the image contents may

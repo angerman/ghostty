@@ -1285,8 +1285,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // the case a timer exists to handle.
                 self.next_animation_delay_ms = animation: {
                     const storage = &state.terminal.screens.active.kitty_images;
-                    const now_ms = storage.animationNowMs() orelse break :animation null;
+
+                    // Ask what is due before touching the clock. With
+                    // nothing animating -- which is almost always -- this
+                    // is a field read and a return, and the idle path does
+                    // not sample or lazily initialize a monotonic clock on
+                    // every single frame just to discard the answer.
                     const due_ms = storage.nextAnimationDeadline() orelse break :animation null;
+                    const now_ms = storage.animationNowMs() orelse break :animation null;
 
                     // An overdue animation still waits a tick rather than
                     // firing a zero-delay timer.

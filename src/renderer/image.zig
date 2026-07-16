@@ -391,6 +391,11 @@ pub const State = struct {
             }
         }
 
+        // Tell terminal storage which images we actually draw, so that
+        // animation scheduling follows what is on screen rather than what
+        // merely exists. This is the only place that knows.
+        storage.setDrawn(&self.kitty_visible);
+
         // Sort the placements by their Z value.
         std.mem.sortUnstable(
             Placement,
@@ -1327,4 +1332,62 @@ test "kitty: steady-state frames do not touch the allocator" {
     try testing.expectEqual(allocs, counting.allocs);
     try testing.expectEqual(frees, counting.frees);
     try testing.expectEqual(resizes, counting.resizes);
+}
+
+test "kitty: scrolling out of view stops scheduling" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 4, .cols = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 40;
+
+    const storage = &t.screens.active.kitty_images;
+
+    const data = try alloc.alloc(u8, 2 * 2 * 4);
+    @memset(data, 1);
+    {
+        errdefer alloc.free(data);
+        try storage.addImage(alloc, t.screens.active, .{
+            .id = 1,
+            .width = 2,
+            .height = 2,
+            .format = .rgba,
+            .data = data,
+        });
+    }
+    const pin = try t.screens.active.pages.trackPin(
+        t.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
+    );
+    try storage.addPlacement(alloc, 1, 0, .{ .location = .{ .pin = pin } });
+
+    const src: [2 * 2 * 4]u8 = @splat(9);
+    _ = try storage.addAnimationFrame(alloc, t.screens.active, 1, .{}, &src, .rgba, 2, 2, 0);
+    const anim = storage.images.getPtr(1).?.anim.?;
+    anim.state = .running;
+    anim.setGap(0, 100);
+    anim.setGap(1, 100);
+
+    var state: State = .empty;
+    defer state.deinit(alloc);
+    const cell_size: CellSize = .{ .width = 10, .height = 10 };
+
+    // Drawn: it schedules.
+    state.kittyUpdatePlacements(alloc, &t, cell_size);
+    try testing.expect(storage.images.getPtr(1).?.drawn);
+    try testing.expect(storage.nextAnimationDeadline() != null);
+
+    // Scroll the placement far into the scrollback. The image is still in
+    // storage and still has a placement, but nothing draws it, so it must
+    // not keep a timer armed or wake the renderer.
+    for (0..64) |_| try t.index();
+    state.kittyUpdatePlacements(alloc, &t, cell_size);
+    try testing.expect(!storage.images.getPtr(1).?.drawn);
+    try testing.expectEqual(@as(?u64, null), storage.nextAnimationDeadline());
+
+    const r = storage.animationTick(10_000);
+    try testing.expect(!r.dirtied);
+    try testing.expectEqual(@as(?u64, null), r.next_due_ms);
+    try testing.expect(!state.kittyRequiresPixelUpdate(&t));
 }
