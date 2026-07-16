@@ -809,7 +809,22 @@ pub const ImageStorage = struct {
         // it already is RGBA, so a failure can't leave it half-composed.
         const root_is_target = !is_new and frame == 1;
         const root_is_base = is_new and params.create_frame == 1;
-        const need_root = root_is_target or (root_is_base and img.format != .rgba);
+
+        // An edit composes into a copy so that a failure part way through
+        // cannot leave a frame half written. But when nothing *can* fail,
+        // that copy buys nothing and costs a full canvas allocated,
+        // copied and freed for every frame -- at 1080p, most of a frame
+        // budget, which is exactly the live VNC/video case.
+        //
+        // Nothing can fail once the target already is RGBA (no widening
+        // to allocate) and the source already is RGBA (borrowed, not
+        // converted), because an edit persists no extra bytes and so can
+        // neither evict nor grow the frame list.
+        const target_is_rgba = if (root_is_target) img.format == .rgba else true;
+        const in_place = !is_new and target_is_rgba and src_format == .rgba;
+
+        const need_root = !in_place and
+            (root_is_target or (root_is_base and img.format != .rgba));
         const root_growth: usize = if (need_root) canvas_len - img.data.len else 0;
 
         // Preflight the transient cost before allocating any of it: the
@@ -822,7 +837,7 @@ pub const ImageStorage = struct {
         else
             0;
         const new_root_len: usize = if (need_root) canvas_len else 0;
-        const target_len: usize = if (root_is_target) 0 else canvas_len;
+        const target_len: usize = if (root_is_target or in_place) 0 else canvas_len;
         try self.checkTransient(std.math.add(usize, new_root_len, target_len) catch
             return error.OutOfSpace);
         try self.checkTransient(rect_rgba);
@@ -855,6 +870,13 @@ pub const ImageStorage = struct {
         // The buffer we compose into: a new canvas, or a copy of the frame
         // being edited. Editing the root composes into its widened copy.
         const target: []u8 = target: {
+            // Compose straight into the stored pixels when nothing can
+            // fail; there is nothing to roll back from.
+            if (in_place) break :target if (frame == 1)
+                @constCast(img.data)
+            else
+                img.anim.?.frames.items[frame - 2].data;
+
             if (root_is_target) break :target new_root.?;
 
             const buf = try alloc.alloc(u8, canvas_len);
@@ -874,7 +896,7 @@ pub const ImageStorage = struct {
 
             break :target buf;
         };
-        errdefer if (!root_is_target) alloc.free(target);
+        errdefer if (!root_is_target and !in_place) alloc.free(target);
 
         // View the transmitted rectangle as RGBA and compose it. Data
         // that already is RGBA is borrowed rather than duplicated, which
@@ -934,6 +956,8 @@ pub const ImageStorage = struct {
                 .gap_ms = animation.resolveNewGap(params.gap),
             });
             self.total_bytes += target.len;
+        } else if (in_place) {
+            // Already composed into the stored pixels: nothing to swap in.
         } else if (!root_is_target) {
             const old = anim.frames.items[frame - 2].data;
             assert(old.len == target.len);
