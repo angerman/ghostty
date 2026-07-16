@@ -72,10 +72,7 @@ pub fn execute(
                 },
             };
 
-            break :resp switch (cmd.control) {
-                .transmit_animation_frame => transmitAnimationFrame(alloc, terminal, cmd),
-                else => transmit(alloc, terminal, cmd),
-            };
+            break :resp transmitFamily(alloc, terminal, cmd);
         },
     };
 
@@ -131,6 +128,106 @@ fn query(
     return result;
 }
 
+/// Take the in-progress load out of storage, transferring ownership to the
+/// caller.
+///
+/// This is the only way a load leaves storage, so completion and error
+/// paths cannot disagree about who frees it.
+fn takeLoading(storage: *ImageStorage) ?*LoadingImage {
+    const loading = storage.loading orelse return null;
+    storage.loading = null;
+    return loading;
+}
+
+/// Abandon any load in progress, freeing it.
+///
+/// Call this at the point a new load is definitely starting: Kitty does
+/// exactly this (initialize_load_data begins with free_load_data), and it
+/// is what stops a malformed interleaved stream from stranding buffered
+/// payloads for unbounded memory growth. Validation failures must happen
+/// before this so a rejected command leaves the active load usable.
+fn abandonLoading(alloc: Allocator, storage: *ImageStorage) void {
+    const old = takeLoading(storage) orelse return;
+    log.debug("abandoning in-progress load for a new one", .{});
+    old.destroy(alloc);
+}
+
+/// Install a newly started load.
+///
+/// The caller must already have abandoned any load in progress, so this
+/// can never strand one; the assert keeps that structural.
+fn installLoading(storage: *ImageStorage, loading: *LoadingImage) void {
+    assert(storage.loading == null);
+    storage.loading = loading;
+}
+
+/// Execute any command that transmits data: "a=t", "a=T", "a=f", and the
+/// actionless continuation chunk that Ghostty also accepts.
+///
+/// They share an entry point because only one load may be in progress and
+/// it must have exactly one owner. Kitty routes *any* direct-medium
+/// transmission command into the load already in progress, using the
+/// parameters that load began with: the identifiers, format and dimensions
+/// on a continuation are ignored, and an "a=f" resolves its target from the
+/// active load rather than from its own "i"/"I". See graphics.c at
+/// f47590533d7177daf0b74963f9d1b7581467af20: the `init_img` test in
+/// handle_add_command, the `case 'f'` dispatch that prefers
+/// `currently_loading.loading_for.image_id`, and INIT_CHUNKED_LOAD.
+fn transmitFamily(
+    alloc: Allocator,
+    terminal: *Terminal,
+    cmd: *const Command,
+) Response {
+    const storage = &terminal.screens.active.kitty_images;
+
+    // Only the direct medium streams in chunks; a file or shared-memory
+    // command carries its path in one go and always starts a new load.
+    if (storage.loading != null and cmd.transmission().?.medium == .direct) {
+        return continueLoad(alloc, terminal, cmd);
+    }
+
+    return switch (cmd.control) {
+        .transmit_animation_frame => startFrameLoad(alloc, terminal, cmd),
+        else => transmit(alloc, terminal, cmd),
+    };
+}
+
+/// Append a chunk to the in-progress load, finishing it as whatever kind of
+/// load it started as once the last chunk arrives.
+fn continueLoad(
+    alloc: Allocator,
+    terminal: *Terminal,
+    cmd: *const Command,
+) Response {
+    const storage = &terminal.screens.active.kitty_images;
+    const loading = storage.loading.?;
+
+    // The response identifies the load, not this chunk: a continuation
+    // carries no identifiers of its own.
+    var result: Response = if (loading.frame) |f| .{
+        .id = f.target_image_id,
+    } else .{
+        .id = loading.image.id,
+        .image_number = loading.image.number,
+    };
+
+    loading.addData(alloc, cmd.data) catch |err| {
+        takeLoading(storage).?.destroy(alloc);
+        encodeError(&result, err);
+        return result;
+    };
+
+    // Intermediate chunks are never responded to.
+    if (cmd.transmission().?.more_chunks) return .{};
+
+    // That was the last chunk. Take the load out of storage so that it has
+    // exactly one owner from here on, whatever happens.
+    const owned = takeLoading(storage).?;
+    defer alloc.destroy(owned);
+    if (owned.frame != null) return finishAnimationFrame(alloc, terminal, owned, result);
+    return finishTransmit(alloc, terminal, owned, cmd, result);
+}
+
 /// Transmit image data.
 ///
 /// This loads the image, validates it, and puts it into the terminal
@@ -140,16 +237,6 @@ fn transmit(
     terminal: *Terminal,
     cmd: *const Command,
 ) Response {
-    const storage = &terminal.screens.active.kitty_images;
-
-    // The protocol requires "a=f" on every chunk of an animation frame,
-    // but Ghostty also accepts a final chunk with no action at all, which
-    // parses as a plain transmit. If a frame load is in progress, such a
-    // chunk belongs to it.
-    if (storage.loading) |loading| {
-        if (loading.frame != null) return transmitAnimationFrame(alloc, terminal, cmd);
-    }
-
     const t = cmd.transmission().?;
     var result: Response = .{
         .id = t.image_id,
@@ -160,35 +247,94 @@ fn transmit(
         return .{ .message = "EINVAL: image ID and number are mutually exclusive" };
     }
 
-    const load = loadAndAddImage(alloc, terminal, cmd) catch |err| {
+    const storage = &terminal.screens.active.kitty_images;
+    var loading = LoadingImage.init(alloc, cmd, storage.image_limits) catch |err| {
+        // Rejected before starting, so an active load stays usable.
         encodeError(&result, err);
         return result;
     };
-    errdefer load.image.deinit(alloc);
 
-    // If we're also displaying, then do that now. This function does
-    // both transmit and transmit and display. The display might also be
-    // deferred if it is multi-chunk.
-    if (load.display) |d| {
-        assert(!load.more);
+    // We are definitely starting a load now, so any load in progress is
+    // abandoned here, which is where Kitty abandons it too.
+    abandonLoading(alloc, storage);
+
+    // If the image has no ID, we assign one
+    if (loading.image.id == 0) {
+        loading.image.id = storage.next_image_id;
+        storage.next_image_id +%= 1;
+
+        // If the image also has no number then its auto-ID is "implicit".
+        // See the doc comment on the Image.implicit_id field for more detail.
+        if (loading.image.number == 0) loading.image.implicit_id = true;
+    }
+
+    // If more chunks are coming, park the load until they arrive. We
+    // allocate the pointer on the heap because its rare and we don't want
+    // to always pay the memory cost to keep it around.
+    if (t.more_chunks) {
+        const ptr = alloc.create(LoadingImage) catch {
+            loading.deinit(alloc);
+            result.message = "ENOMEM: out of memory";
+            return result;
+        };
+        ptr.* = loading;
+        installLoading(storage, ptr);
+        return .{};
+    }
+
+    return finishTransmit(alloc, terminal, &loading, cmd, result);
+}
+
+/// Complete a fully-received image load, store it, and display it if the
+/// command that started the load asked for that.
+///
+/// Deinitializes the load's contents on every path; the caller owns any
+/// heap allocation holding the load itself.
+fn finishTransmit(
+    alloc: Allocator,
+    terminal: *Terminal,
+    loading: *LoadingImage,
+    cmd: *const Command,
+    base: Response,
+) Response {
+    defer loading.deinit(alloc);
+
+    const storage = &terminal.screens.active.kitty_images;
+    var result = base;
+
+    // Dump the image data before it is decompressed
+    // loading.debugDump() catch unreachable;
+
+    // Validate and store our image. complete() takes the pixels out of the
+    // load, so the deferred deinit above won't double free them.
+    var img = loading.complete(alloc) catch |err| {
+        encodeError(&result, err);
+        return result;
+    };
+    storage.addImage(alloc, img) catch |err| {
+        img.deinit(alloc);
+        encodeError(&result, err);
+        return result;
+    };
+
+    // If we're also displaying, then do that now. The display is carried
+    // by the load because it may have been deferred across chunks.
+    if (loading.display) |d| {
         var d_copy = d;
-        d_copy.image_id = load.image.id;
+        d_copy.image_id = img.id;
         result = display(alloc, terminal, &.{
             .control = .{ .display = d_copy },
             .quiet = cmd.quiet,
         });
     }
 
-    // If there are more chunks expected we do not respond.
-    if (load.more) return .{};
-
     // If the loaded image was assigned its ID automatically, not based
     // on a number or explicitly specified ID, then we don't respond.
-    if (load.image.implicit_id) return .{};
+    if (img.implicit_id) return .{};
 
     // After the image is added, set the ID in case it changed.
     // The resulting image number and placement ID never change.
-    result.id = load.image.id;
+    result.id = img.id;
 
     return result;
 }
@@ -332,45 +478,19 @@ fn delete(
     return .{};
 }
 
-/// Transmit an animation frame ("a=f"), or a continuation chunk of one.
+/// Start an animation frame load ("a=f").
 ///
 /// The frame's pixels are composed into an existing image rather than
 /// becoming an image of their own, so unlike a transmit this needs the
-/// target to already exist.
-fn transmitAnimationFrame(
+/// target to already exist. Continuation chunks do not come here; see
+/// transmitFamily.
+fn startFrameLoad(
     alloc: Allocator,
     terminal: *Terminal,
     cmd: *const Command,
 ) Response {
     const storage = &terminal.screens.active.kitty_images;
     const t = cmd.transmission().?;
-
-    // A chunk of a frame already in progress: it carries only "m" and
-    // maybe "q", so the target and parameters come from the initial chunk.
-    if (storage.loading) |loading| {
-        if (loading.frame) |frame| {
-            var result: Response = .{ .id = frame.target_image_id };
-
-            loading.addData(alloc, cmd.data) catch |err| {
-                loading.destroy(alloc);
-                storage.loading = null;
-                encodeError(&result, err);
-                return result;
-            };
-
-            // More to come; intermediate chunks are never responded to.
-            if (t.more_chunks) return .{};
-
-            // That was the last chunk. Take ownership of the load so it
-            // is cleaned up exactly once however this turns out.
-            var owned = loading.*;
-            alloc.destroy(loading);
-            storage.loading = null;
-            return finishAnimationFrame(alloc, terminal, &owned, result);
-        }
-    }
-
-    // --- The initial chunk. ---
 
     const f = cmd.control.transmit_animation_frame.frame;
     var result: Response = .{ .id = t.image_id, .image_number = t.image_number };
@@ -401,6 +521,10 @@ fn transmitAnimationFrame(
     };
     loading.frame = .{ .target_image_id = target_id, .params = f };
 
+    // As in transmit: the load has definitely started, so abandon any that
+    // was in progress. Everything above this can still reject and leave it.
+    abandonLoading(alloc, storage);
+
     // If more chunks are coming, park the load until they arrive.
     if (t.more_chunks) {
         const ptr = alloc.create(LoadingImage) catch {
@@ -409,7 +533,7 @@ fn transmitAnimationFrame(
             return result;
         };
         ptr.* = loading;
-        storage.loading = ptr;
+        installLoading(storage, ptr);
         return .{};
     }
 
@@ -607,83 +731,6 @@ fn composeAnimation(
     };
 
     return result;
-}
-
-fn loadAndAddImage(
-    alloc: Allocator,
-    terminal: *Terminal,
-    cmd: *const Command,
-) !struct {
-    image: Image,
-    more: bool = false,
-    display: ?command.Display = null,
-} {
-    const t = cmd.transmission().?;
-    const storage = &terminal.screens.active.kitty_images;
-
-    // Determine our image. This also handles chunking and early exit.
-    var loading: LoadingImage = if (storage.loading) |loading| loading: {
-        // Note: we do NOT want to call "cmd.toOwnedData" here because
-        // we're _copying_ the data. We want the command data to be freed.
-        try loading.addData(alloc, cmd.data);
-
-        // If we have more then we're done
-        if (t.more_chunks) return .{ .image = loading.image, .more = true };
-
-        // We have no more chunks. We're going to be completing the
-        // image so we want to destroy the pointer to the loading
-        // image and copy it out.
-        defer {
-            alloc.destroy(loading);
-            storage.loading = null;
-        }
-
-        break :loading loading.*;
-    } else try .init(alloc, cmd, storage.image_limits);
-
-    // We only want to deinit on error. If we're chunking, then we don't
-    // want to deinit at all. If we're not chunking, then we'll deinit
-    // after we've copied the image out.
-    errdefer loading.deinit(alloc);
-
-    // If the image has no ID, we assign one
-    if (loading.image.id == 0) {
-        loading.image.id = storage.next_image_id;
-        storage.next_image_id +%= 1;
-
-        // If the image also has no number then its auto-ID is "implicit".
-        // See the doc comment on the Image.implicit_id field for more detail.
-        if (loading.image.number == 0) loading.image.implicit_id = true;
-    }
-
-    // If this is chunked, this is the beginning of a new chunked transmission.
-    // (We checked for an in-progress chunk above.)
-    if (t.more_chunks) {
-        // We allocate the pointer on the heap because its rare and we
-        // don't want to always pay the memory cost to keep it around.
-        const loading_ptr = try alloc.create(LoadingImage);
-        errdefer alloc.destroy(loading_ptr);
-        loading_ptr.* = loading;
-        storage.loading = loading_ptr;
-        return .{ .image = loading.image, .more = true };
-    }
-
-    // Dump the image data before it is decompressed
-    // loading.debugDump() catch unreachable;
-
-    // Validate and store our image
-    var img = try loading.complete(alloc);
-    errdefer img.deinit(alloc);
-    try storage.addImage(alloc, img);
-
-    // Get our display settings
-    const display_ = loading.display;
-
-    // Ensure we deinit the loading state because we're done. The image
-    // won't be deinit because of "complete" above.
-    loading.deinit(alloc);
-
-    return .{ .image = img, .display = display_ };
 }
 
 const EncodeableError = Image.Error || Allocator.Error;
@@ -1560,4 +1607,137 @@ test "kittygfx animation frame: formats agree" {
             t.screens.active.kitty_images.images.getPtr(1).?.anim.?.frames.items[0].data,
         );
     }
+}
+
+/// Drive a command string and drop the response, for tests that only care
+/// about the resulting state.
+fn testExec(alloc: Allocator, t: *Terminal, str: []const u8) !void {
+    const cmd = try command.Parser.parseString(alloc, str);
+    defer cmd.deinit(alloc);
+    _ = execute(alloc, t, &cmd);
+}
+
+test "kittygfx active load swallows interleaved transmissions" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    try testTransmitImage(alloc, &t, 1);
+
+    const storage = &t.screens.active.kitty_images;
+
+    // While a direct-medium load is in progress, Kitty routes every
+    // further direct transmission into it and ignores the identifiers,
+    // dimensions and action those commands carry: an "a=f" here resolves
+    // its target from the active load, not from its own "i". So this is
+    // one four-chunk load of image 2, not a frame of image 1.
+    try testExec(alloc, &t, "a=t,f=32,t=d,i=2,s=2,v=2,m=1;AAAA");
+    try testing.expect(storage.loading != null);
+    try testing.expect(storage.loading.?.frame == null);
+
+    try testExec(alloc, &t, "a=f,i=1,f=32,s=99,v=99,m=1;AAAA");
+    try testing.expect(storage.loading.?.frame == null);
+    try testing.expectEqual(@as(u32, 2), storage.loading.?.image.id);
+
+    try testExec(alloc, &t, "a=T,i=7,m=1;AAAA");
+    try testing.expectEqual(@as(u32, 2), storage.loading.?.image.id);
+
+    try testExec(alloc, &t, "m=0;AAAAAAAAAA==");
+    try testing.expect(storage.loading == null);
+
+    // The completed image is the one the load started as: 2x2 RGBA.
+    const img = storage.images.getPtr(2).?;
+    try testing.expectEqual(@as(u32, 2), img.width);
+    try testing.expectEqual(@as(u32, 2), img.height);
+    try testing.expect(img.anim == null);
+
+    // Image 1 was never touched by the interleaved "a=f".
+    try testing.expect(storage.images.getPtr(1).?.anim == null);
+}
+
+test "kittygfx starting a new load abandons the active one" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const storage = &t.screens.active.kitty_images;
+
+    // A non-direct medium never continues a load, so it starts a new one
+    // and the abandoned load's buffered payload must be freed rather than
+    // stranded. Repeated, stranding it is unbounded memory growth from a
+    // malformed stream. The file load itself fails here (no such file),
+    // which is fine: what matters is that the owner pointer is not leaked.
+    for (0..16) |_| {
+        try testExec(alloc, &t, "a=t,f=32,t=d,i=3,s=64,v=64,m=1;AAAAAAAAAAAAAAAA");
+        try testing.expect(storage.loading != null);
+        try testExec(alloc, &t, "a=t,f=32,t=f,i=4,s=1,v=1;L3RtcC9ub3BlLWdob3N0dHk=");
+    }
+
+    // Terminate the last load so the test's own teardown isn't what frees
+    // it, then prove nothing is retained.
+    try testExec(alloc, &t, "m=0;AAAA");
+    try testing.expect(storage.loading == null);
+}
+
+test "kittygfx load rejected before starting keeps the active load" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const storage = &t.screens.active.kitty_images;
+    try testExec(alloc, &t, "a=t,f=32,t=d,i=5,s=2,v=2,m=1;AAAA");
+    try testing.expect(storage.loading != null);
+
+    // A command that fails validation before its load starts must leave
+    // the in-progress load usable, not destroy it. An unsupported medium
+    // is rejected inside LoadingImage.init.
+    try testExec(alloc, &t, "a=t,f=32,t=s,i=6,s=1,v=1;L25vcGU=");
+    try testing.expect(storage.loading != null);
+    try testing.expectEqual(@as(u32, 5), storage.loading.?.image.id);
+
+    try testExec(alloc, &t, "m=0;AAAAAAAAAAAAAAAAAA==");
+    try testing.expect(storage.loading == null);
+    try testing.expect(storage.images.getPtr(5) != null);
+}
+
+test "kittygfx interrupted loads retain nothing" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+    try testTransmitImage(alloc, &t, 1);
+
+    const storage = &t.screens.active.kitty_images;
+    const bytes_before = storage.total_bytes;
+
+    // Every way a load can end badly, repeated: the testing allocator
+    // fails the test if any of them retains an allocation.
+    for (0..8) |_| {
+        // Decode failure: too little data for the declared frame.
+        try testExec(alloc, &t, "a=f,i=1,f=32,s=2,v=2,m=1;AAAA");
+        try testExec(alloc, &t, "a=f,m=0;");
+        try testing.expect(storage.loading == null);
+
+        // Frame load left dangling, then abandoned by a fresh load.
+        try testExec(alloc, &t, "a=f,i=1,f=32,s=2,v=2,m=1;AAAA");
+        try testExec(alloc, &t, "a=t,f=32,t=f,i=9,s=1,v=1;L3RtcC9ub3Bl");
+        try testExec(alloc, &t, "m=0;AAAA");
+        try testing.expect(storage.loading == null);
+
+        // Oversized payload for the declared image: completes with the
+        // required prefix for a frame, so terminate it cleanly.
+        try testExec(alloc, &t, "a=f,i=1,f=32,s=1,v=1,m=1;/wAA/xERERE=");
+        try testExec(alloc, &t, "a=f,m=0;");
+        try testing.expect(storage.loading == null);
+    }
+
+    // The interrupted loads stored one frame per successful oversized
+    // case; nothing else grew, and no load is retained.
+    try testing.expect(storage.total_bytes >= bytes_before);
 }
