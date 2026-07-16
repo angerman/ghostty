@@ -239,6 +239,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// thread, so it needs no synchronization of its own.
         next_animation_delay_ms: ?u64 = null,
 
+        /// The same deadline in absolute terms, on the image storage's
+        /// clock. The thread compares this with what its timer is already
+        /// armed for, so that an update which did not change the schedule
+        /// -- a pixel-only upload, say -- does not reset an identical
+        /// timer.
+        next_animation_due_ms: ?u64 = null,
+
         /// Our overlay state, if any.
         overlay: ?Overlay = null,
 
@@ -1151,6 +1158,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // frame we shouldn't be waking up for. It's recomputed below
             // if anything is actually animating.
             self.next_animation_delay_ms = null;
+            self.next_animation_due_ms = null;
 
             // We fully deinit and reset the terminal state every so often
             // so that a particularly large terminal state doesn't cause
@@ -1293,6 +1301,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // every single frame just to discard the answer.
                     const due_ms = storage.nextAnimationDeadline() orelse break :animation null;
                     const now_ms = storage.animationNowMs() orelse break :animation null;
+                    self.next_animation_due_ms = due_ms;
 
                     // An overdue animation still waits a tick rather than
                     // firing a zero-delay timer.

@@ -81,6 +81,18 @@ anim_h: xev.Timer,
 anim_c: xev.Completion = .{},
 anim_c_cancel: xev.Completion = .{},
 
+/// The deadline the animation timer is currently armed for, on the image
+/// storage's clock. Used to skip re-arming a timer that is already waiting
+/// for exactly this moment, which is every update that changed pixels but
+/// not the schedule.
+anim_armed_due_ms: ?u64 = null,
+
+/// Counts of animation timer arms and renderer wakeups caused by
+/// animation. The steady state must be one of each per displayed frame;
+/// these make that measurable rather than assumed.
+anim_arms: usize = 0,
+anim_wakeups: usize = 0,
+
 /// Incremental scrollback compression scheduling.
 compression: Compression = undefined,
 
@@ -408,6 +420,7 @@ fn drainMailbox(self: *Thread) !void {
                 } else if (self.anim_c.state() == .active and
                     self.anim_c_cancel.state() == .dead)
                 {
+                    self.anim_armed_due_ms = null;
                     // Occluded windows animate nothing, so stop the timer
                     // now rather than waiting for its deadline to come
                     // around and find there's nothing to do.
@@ -705,6 +718,7 @@ fn renderCallback(
 /// Arm the animation timer to fire in delay_ms, moving its deadline if it
 /// is already armed. This never touches terminal state.
 fn scheduleAnimationDelay(self: *Thread, delay_ms: u64) void {
+    self.anim_arms += 1;
     self.anim_h.reset(
         &self.loop,
         &self.anim_c,
@@ -724,9 +738,21 @@ fn scheduleAnimationDelay(self: *Thread, delay_ms: u64) void {
 /// of which need the terminal state mutex.
 fn syncAnimationTimer(self: *Thread) void {
     if (self.renderer.next_animation_delay_ms) |delay_ms| {
+        // An update that changed pixels but not the schedule leaves the
+        // deadline exactly where it was, and re-arming for the same
+        // moment is pure churn.
+        if (self.anim_c.state() == .active and
+            self.anim_armed_due_ms != null and
+            self.anim_armed_due_ms.? == self.renderer.next_animation_due_ms)
+        {
+            return;
+        }
+
+        self.anim_armed_due_ms = self.renderer.next_animation_due_ms;
         self.scheduleAnimationDelay(delay_ms);
         return;
     }
+    self.anim_armed_due_ms = null;
 
     // Nothing to animate. Cancel an outstanding timer rather than letting
     // it fire and find nothing to do.
@@ -817,15 +843,25 @@ fn animTimerCallback(
         };
     };
 
-    // A null delay means nothing is waiting, so returning .disarm here is
-    // what actually stops the timer.
-    if (delay) |ms| t.scheduleAnimationDelay(ms);
+    // Exactly one thing arms the timer per displayed frame. If we woke the
+    // renderer, the updateFrame that follows recomputes the deadline and
+    // arms it; arming here as well would mean two arms and a reset for the
+    // same moment. If nothing was dirtied there is no update coming, so
+    // this is the only chance to re-arm.
+    //
+    // A null delay means nothing is waiting, and returning .disarm is what
+    // actually stops the timer.
+    if (dirtied) {
+        t.anim_wakeups += 1;
+        t.wakeup.notify() catch |err| {
+            log.warn("error waking up for animation err={}", .{err});
 
-    // Only wake the renderer if pixels actually changed. This goes through
-    // the normal wakeup so the frame is rebuilt and drawn as usual.
-    if (dirtied) t.wakeup.notify() catch |err| {
-        log.warn("error waking up for animation err={}", .{err});
-    };
+            // The update that would have re-armed isn't coming now.
+            if (delay) |ms| t.scheduleAnimationDelay(ms);
+        };
+    } else if (delay) |ms| {
+        t.scheduleAnimationDelay(ms);
+    }
 
     return .disarm;
 }
