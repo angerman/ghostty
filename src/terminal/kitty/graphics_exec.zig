@@ -311,7 +311,7 @@ fn finishTransmit(
         encodeError(&result, err);
         return result;
     };
-    storage.addImage(alloc, img) catch |err| {
+    storage.addImage(alloc, terminal.screens.active, img) catch |err| {
         img.deinit(alloc);
         encodeError(&result, err);
         return result;
@@ -568,6 +568,7 @@ fn finishAnimationFrame(
 
     const stored = storage.addAnimationFrame(
         alloc,
+        terminal.screens.active,
         frame.target_image_id,
         frame.params,
         loading.data.items,
@@ -722,6 +723,7 @@ fn composeAnimation(
 
     _ = storage.composeAnimationFrames(
         alloc,
+        terminal.screens.active,
         target_id,
         c,
         storage.animationNowMs() orelse 0,

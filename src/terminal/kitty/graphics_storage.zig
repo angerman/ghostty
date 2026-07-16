@@ -242,7 +242,7 @@ pub const ImageStorage = struct {
         if (limit < self.total_bytes) {
             const req_bytes = self.total_bytes - limit;
             log.info("evicting images to lower limit, evicting={}", .{req_bytes});
-            if (!try self.evictImage(alloc, req_bytes)) {
+            if (!try self.evictImage(alloc, s, req_bytes)) {
                 log.warn("failed to evict enough images for required bytes", .{});
             }
         }
@@ -252,7 +252,12 @@ pub const ImageStorage = struct {
 
     /// Add an already-loaded image to the storage. This will automatically
     /// free any existing image with the same ID.
-    pub fn addImage(self: *ImageStorage, alloc: Allocator, img: Image) Allocator.Error!void {
+    pub fn addImage(
+        self: *ImageStorage,
+        alloc: Allocator,
+        s: *terminal.Screen,
+        img: Image,
+    ) Allocator.Error!void {
         // If the image itself is over the limit, then error immediately
         if (img.byteSize() > self.total_limit) return error.OutOfMemory;
 
@@ -261,7 +266,7 @@ pub const ImageStorage = struct {
         if (total_bytes > self.total_limit) {
             const req_bytes = total_bytes - self.total_limit;
             log.info("evicting images to make space for {} bytes", .{req_bytes});
-            if (!try self.evictImage(alloc, req_bytes)) {
+            if (!try self.evictImage(alloc, s, req_bytes)) {
                 log.warn("failed to evict enough images for required bytes", .{});
                 return error.OutOfMemory;
             }
@@ -560,17 +565,11 @@ pub const ImageStorage = struct {
             self: *const AnimationReservation,
             storage: *ImageStorage,
             alloc: Allocator,
+            s: *terminal.Screen,
         ) void {
             var evicted: usize = 0;
             for (self.victims) |c| {
-                // Note that this matches evictImage in dropping the
-                // placements without deiniting them.
-                var p_it = storage.placements.iterator();
-                while (p_it.next()) |entry| {
-                    if (entry.key_ptr.image_id == c.id) {
-                        storage.placements.removeByPtr(entry.key_ptr);
-                    }
-                }
+                _ = storage.removePlacementsForImage(s, c.id);
 
                 if (storage.images.getEntry(c.id)) |entry| {
                     log.info("evicting image id={} bytes={}", .{ c.id, c.bytes });
@@ -650,6 +649,7 @@ pub const ImageStorage = struct {
     pub fn addAnimationFrame(
         self: *ImageStorage,
         alloc: Allocator,
+        s: *terminal.Screen,
         image_id: u32,
         params: command.AnimationFrameLoading,
         src: []const u8,
@@ -763,7 +763,7 @@ pub const ImageStorage = struct {
 
         // --- Commit. Nothing from here on may fail. ---
 
-        reservation.commit(self, alloc);
+        reservation.commit(self, alloc, s);
 
         if (anim_is_new) {
             img.anim = anim;
@@ -820,6 +820,7 @@ pub const ImageStorage = struct {
     pub fn composeAnimationFrames(
         self: *ImageStorage,
         alloc: Allocator,
+        s: *terminal.Screen,
         image_id: u32,
         params: command.AnimationFrameComposition,
         now_ms: u64,
@@ -919,7 +920,7 @@ pub const ImageStorage = struct {
 
         // --- Commit. Nothing from here on may fail. ---
 
-        reservation.commit(self, alloc);
+        reservation.commit(self, alloc, s);
 
         if (new_root) |root| {
             self.total_bytes = self.total_bytes - img.data.len + root.len;
@@ -1316,12 +1317,36 @@ pub const ImageStorage = struct {
         }
     }
 
+    /// Remove every placement of an image, releasing the pins they track.
+    /// Returns true if any placement was removed.
+    ///
+    /// This is the only correct way to drop placements. A placement removed
+    /// from the map without being deinitialized leaves its pin registered
+    /// in the PageList forever, so evicting placed images leaks pins and
+    /// makes every subsequent page update more expensive.
+    fn removePlacementsForImage(
+        self: *ImageStorage,
+        s: *terminal.Screen,
+        image_id: u32,
+    ) bool {
+        var removed = false;
+        var it = self.placements.iterator();
+        while (it.next()) |entry| {
+            if (entry.key_ptr.image_id != image_id) continue;
+            entry.value_ptr.deinit(s);
+            self.placements.removeByPtr(entry.key_ptr);
+            removed = true;
+        }
+        return removed;
+    }
+
     /// Remove an image from the map, freeing it and keeping every piece of
     /// accounting (byte total, animation count) in step. Returns the bytes
     /// freed, which includes any animation frames the image owned.
     ///
     /// This is the only way images should be removed: doing it by hand is
-    /// how the byte total drifts.
+    /// how the byte total drifts. Note this does not touch placements; the
+    /// caller must have removed them via removePlacementsForImage.
     fn removeImage(
         self: *ImageStorage,
         alloc: Allocator,
@@ -1367,7 +1392,12 @@ pub const ImageStorage = struct {
     ///
     /// This will evict as many images as necessary to make space for
     /// req bytes.
-    fn evictImage(self: *ImageStorage, alloc: Allocator, req: usize) !bool {
+    fn evictImage(
+        self: *ImageStorage,
+        alloc: Allocator,
+        s: *terminal.Screen,
+        req: usize,
+    ) !bool {
         assert(req <= self.total_limit);
 
         const candidates = try self.evictionCandidates(alloc, 0);
@@ -1382,13 +1412,7 @@ pub const ImageStorage = struct {
         var evicted: usize = 0;
         for (candidates) |c| {
             // Delete all the placements for this image and the image.
-            var p_it = self.placements.iterator();
-            while (p_it.next()) |entry| {
-                if (entry.key_ptr.image_id == c.id) {
-                    self.placements.removeByPtr(entry.key_ptr);
-                    any_evicted = true;
-                }
-            }
+            if (self.removePlacementsForImage(s, c.id)) any_evicted = true;
 
             if (self.images.getEntry(c.id)) |entry| {
                 log.info("evicting image id={} bytes={}", .{ c.id, entry.value_ptr.byteSize() });
@@ -1396,7 +1420,8 @@ pub const ImageStorage = struct {
                 evicted += self.removeImage(alloc, entry);
                 any_evicted = true;
 
-                if (evicted > req) return true;
+                // Freeing exactly the requested bytes is success.
+                if (evicted >= req) return true;
             }
         }
 
@@ -1708,8 +1733,8 @@ test "storage: add placement with zero placement id" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try s.addImage(alloc, .{ .id = 1, .width = 50, .height = 50 });
-    try s.addImage(alloc, .{ .id = 2, .width = 25, .height = 25 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1, .width = 50, .height = 50 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 2, .width = 25, .height = 25 });
     try s.addPlacement(alloc, 1, 0, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
     try s.addPlacement(alloc, 1, 0, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
 
@@ -1736,9 +1761,9 @@ test "storage: delete all placements and images" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try s.addImage(alloc, .{ .id = 1 });
-    try s.addImage(alloc, .{ .id = 2 });
-    try s.addImage(alloc, .{ .id = 3 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 2 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 3 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
 
@@ -1760,9 +1785,9 @@ test "storage: delete all placements and images preserves limit" {
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
     s.total_limit = 5000;
-    try s.addImage(alloc, .{ .id = 1 });
-    try s.addImage(alloc, .{ .id = 2 });
-    try s.addImage(alloc, .{ .id = 3 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 2 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 3 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
 
@@ -1784,9 +1809,9 @@ test "storage: delete all placements" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try s.addImage(alloc, .{ .id = 1 });
-    try s.addImage(alloc, .{ .id = 2 });
-    try s.addImage(alloc, .{ .id = 3 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 2 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 3 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
 
@@ -1807,9 +1832,9 @@ test "storage: delete all placements by image id" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try s.addImage(alloc, .{ .id = 1 });
-    try s.addImage(alloc, .{ .id = 2 });
-    try s.addImage(alloc, .{ .id = 3 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 2 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 3 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
 
@@ -1830,9 +1855,9 @@ test "storage: delete all placements by image id and unused images" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try s.addImage(alloc, .{ .id = 1 });
-    try s.addImage(alloc, .{ .id = 2 });
-    try s.addImage(alloc, .{ .id = 3 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 2 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 3 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
 
@@ -1853,9 +1878,9 @@ test "storage: delete placement by specific id" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try s.addImage(alloc, .{ .id = 1 });
-    try s.addImage(alloc, .{ .id = 2 });
-    try s.addImage(alloc, .{ .id = 3 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 2 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 3 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
@@ -1883,8 +1908,8 @@ test "storage: delete intersecting cursor" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try s.addImage(alloc, .{ .id = 1, .width = 50, .height = 50 });
-    try s.addImage(alloc, .{ .id = 2, .width = 25, .height = 25 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1, .width = 50, .height = 50 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 2, .width = 25, .height = 25 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
     try s.addPlacement(alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
 
@@ -1915,8 +1940,8 @@ test "storage: delete intersecting cursor plus unused" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try s.addImage(alloc, .{ .id = 1, .width = 50, .height = 50 });
-    try s.addImage(alloc, .{ .id = 2, .width = 25, .height = 25 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1, .width = 50, .height = 50 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 2, .width = 25, .height = 25 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
     try s.addPlacement(alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
 
@@ -1947,8 +1972,8 @@ test "storage: delete intersecting cursor hits multiple" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try s.addImage(alloc, .{ .id = 1, .width = 50, .height = 50 });
-    try s.addImage(alloc, .{ .id = 2, .width = 25, .height = 25 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1, .width = 50, .height = 50 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 2, .width = 25, .height = 25 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
     try s.addPlacement(alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
 
@@ -1973,8 +1998,8 @@ test "storage: delete by column" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try s.addImage(alloc, .{ .id = 1, .width = 50, .height = 50 });
-    try s.addImage(alloc, .{ .id = 2, .width = 25, .height = 25 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1, .width = 50, .height = 50 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 2, .width = 25, .height = 25 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
     try s.addPlacement(alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
 
@@ -2005,7 +2030,7 @@ test "storage: delete by column 1x1" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try s.addImage(alloc, .{ .id = 1, .width = 1, .height = 1 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1, .width = 1, .height = 1 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
     try s.addPlacement(alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 0 }) } });
     try s.addPlacement(alloc, 1, 3, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 2, .y = 0 }) } });
@@ -2039,8 +2064,8 @@ test "storage: delete by row" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try s.addImage(alloc, .{ .id = 1, .width = 50, .height = 50 });
-    try s.addImage(alloc, .{ .id = 2, .width = 25, .height = 25 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1, .width = 50, .height = 50 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 2, .width = 25, .height = 25 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
     try s.addPlacement(alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
 
@@ -2071,7 +2096,7 @@ test "storage: delete by row 1x1" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try s.addImage(alloc, .{ .id = 1, .width = 1, .height = 1 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1, .width = 1, .height = 1 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .y = 0 }) } });
     try s.addPlacement(alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .y = 1 }) } });
     try s.addPlacement(alloc, 1, 3, .{ .location = .{ .pin = try trackPin(&t, .{ .y = 2 }) } });
@@ -2103,9 +2128,9 @@ test "storage: delete images by range 1" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try s.addImage(alloc, .{ .id = 1 });
-    try s.addImage(alloc, .{ .id = 2 });
-    try s.addImage(alloc, .{ .id = 3 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 2 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 3 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try testing.expectEqual(@as(usize, 3), s.images.count());
@@ -2128,9 +2153,9 @@ test "storage: delete images by range 2" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try s.addImage(alloc, .{ .id = 1 });
-    try s.addImage(alloc, .{ .id = 2 });
-    try s.addImage(alloc, .{ .id = 3 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 2 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 3 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try testing.expectEqual(@as(usize, 3), s.images.count());
@@ -2153,9 +2178,9 @@ test "storage: delete images by range 3" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try s.addImage(alloc, .{ .id = 1 });
-    try s.addImage(alloc, .{ .id = 2 });
-    try s.addImage(alloc, .{ .id = 3 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 2 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 3 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try testing.expectEqual(@as(usize, 3), s.images.count());
@@ -2178,9 +2203,9 @@ test "storage: delete images by range 4" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try s.addImage(alloc, .{ .id = 1 });
-    try s.addImage(alloc, .{ .id = 2 });
-    try s.addImage(alloc, .{ .id = 3 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 2 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 3 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try testing.expectEqual(@as(usize, 3), s.images.count());
@@ -2252,7 +2277,7 @@ test "storage: generation stamps on image add and replace" {
     // Fresh storage has generation zero (never mutated).
     try testing.expectEqual(@as(u64, 0), s.generation);
 
-    try s.addImage(alloc, .{ .id = 1, .width = 1, .height = 1 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1, .width = 1, .height = 1 });
     const gen1 = s.generation;
     try testing.expect(gen1 > 0);
 
@@ -2260,7 +2285,7 @@ test "storage: generation stamps on image add and replace" {
     try testing.expectEqual(gen1, img1.generation);
 
     // A second image gets a strictly greater stamp.
-    try s.addImage(alloc, .{ .id = 2, .width = 1, .height = 1 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 2, .width = 1, .height = 1 });
     const gen2 = s.generation;
     try testing.expect(gen2 > gen1);
     try testing.expectEqual(gen2, s.imageById(2).?.generation);
@@ -2268,7 +2293,7 @@ test "storage: generation stamps on image add and replace" {
     // Retransmitting the same image ID (identical dimensions) gets a
     // fresh stamp: this is what makes same-sized retransmissions
     // detectable by renderers.
-    try s.addImage(alloc, .{ .id = 1, .width = 1, .height = 1 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1, .width = 1, .height = 1 });
     const gen3 = s.generation;
     try testing.expect(gen3 > gen2);
     try testing.expectEqual(gen3, s.imageById(1).?.generation);
@@ -2285,7 +2310,7 @@ test "storage: generation bumps on placement and delete" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try s.addImage(alloc, .{ .id = 1 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1 });
     const gen_add = s.generation;
 
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
@@ -2311,7 +2336,7 @@ test "storage: generation bumps when setLimit evicts or disables" {
     defer s.deinit(alloc, t.screens.active);
 
     const data = try alloc.dupe(u8, "1234");
-    try s.addImage(alloc, .{ .id = 1, .width = 1, .height = 1, .data = data });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1, .width = 1, .height = 1, .data = data });
     const gen_add = s.generation;
 
     // Lowering the limit evicts the image and must mark a mutation.
@@ -2340,12 +2365,12 @@ test "storage: imageByNumber returns most recently transmitted" {
 
     // Two images sharing a number: the newest transmission wins,
     // regardless of insertion order or clock resolution.
-    try s.addImage(alloc, .{ .id = 1, .number = 7 });
-    try s.addImage(alloc, .{ .id = 2, .number = 7 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1, .number = 7 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 2, .number = 7 });
     try testing.expectEqual(@as(u32, 2), s.imageByNumber(7).?.id);
 
     // Retransmit the first: it becomes the newest.
-    try s.addImage(alloc, .{ .id = 1, .number = 7 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1, .number = 7 });
     try testing.expectEqual(@as(u32, 1), s.imageByNumber(7).?.id);
 }
 
@@ -2373,7 +2398,7 @@ test "storage: no-op delete does not mark a mutation" {
     try testing.expectEqual(@as(u64, 0), s.generation);
 
     // Same for a delete that matches nothing.
-    try s.addImage(alloc, .{ .id = 1 });
+    try s.addImage(alloc, t.screens.active, .{ .id = 1 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     const gen = s.generation;
     s.dirty = false;
@@ -2391,6 +2416,7 @@ test "storage: no-op delete does not mark a mutation" {
 fn testAddImage(
     s: *ImageStorage,
     alloc: Allocator,
+    screen: *terminal.Screen,
     id: u32,
     width: u32,
     height: u32,
@@ -2401,7 +2427,7 @@ fn testAddImage(
     const data = try alloc.alloc(u8, width * height * bpp);
     @memset(data, fill);
     errdefer alloc.free(data);
-    try s.addImage(alloc, .{
+    try s.addImage(alloc, screen, .{
         .id = id,
         .width = width,
         .height = height,
@@ -2418,11 +2444,11 @@ test "storage: animation frame append" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try testAddImage(&s, alloc, 1, 2, 2, .rgba, 0);
+    try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgba, 0);
 
     // A full-canvas frame with no explicit gap.
     const src: [2 * 2 * 4]u8 = @splat(7);
-    const result = try s.addAnimationFrame(alloc, 1, .{}, &src, .rgba, 2, 2, 100);
+    const result = try s.addAnimationFrame(alloc, t.screens.active, 1, .{}, &src, .rgba, 2, 2, 100);
 
     // The frame is appended as protocol frame 2 and is never the current
     // one, so nothing on screen changed.
@@ -2451,11 +2477,11 @@ test "storage: animation frame widens the root" {
     defer s.deinit(alloc, t.screens.active);
 
     // An RGB root is 12 bytes for 2x2.
-    try testAddImage(&s, alloc, 1, 2, 2, .rgb, 3);
+    try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgb, 3);
     try testing.expectEqual(@as(usize, 12), s.total_bytes);
 
     const src: [2 * 2 * 3]u8 = @splat(9);
-    _ = try s.addAnimationFrame(alloc, 1, .{}, &src, .rgb, 2, 2, 0);
+    _ = try s.addAnimationFrame(alloc, t.screens.active, 1, .{}, &src, .rgb, 2, 2, 0);
 
     // The root is widened to RGBA once, and both it and the new frame are
     // charged: 16 + 16.
@@ -2485,10 +2511,10 @@ test "storage: animation frame edit" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try testAddImage(&s, alloc, 1, 2, 2, .rgba, 0);
+    try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgba, 0);
 
     const src: [2 * 2 * 4]u8 = @splat(7);
-    _ = try s.addAnimationFrame(alloc, 1, .{}, &src, .rgba, 2, 2, 0);
+    _ = try s.addAnimationFrame(alloc, t.screens.active, 1, .{}, &src, .rgba, 2, 2, 0);
 
     // Editing a frame that isn't current changes no visible pixels, so
     // the image keeps its generation stamp.
@@ -2497,6 +2523,7 @@ test "storage: animation frame edit" {
     const one: [1 * 1 * 4]u8 = @splat(5);
     const edit = try s.addAnimationFrame(
         alloc,
+        t.screens.active,
         1,
         .{ .edit_frame = 2, .x = 1, .y = 1, .composition_mode = .overwrite },
         &one,
@@ -2517,6 +2544,7 @@ test "storage: animation frame edit" {
     // Editing the current frame (the root) does change what's on screen.
     const edit_root = try s.addAnimationFrame(
         alloc,
+        t.screens.active,
         1,
         .{ .edit_frame = 1, .composition_mode = .overwrite },
         &src,
@@ -2539,17 +2567,17 @@ test "storage: animation frame clamps out of range edits" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try testAddImage(&s, alloc, 1, 1, 1, .rgba, 0);
+    try testAddImage(&s, alloc, t.screens.active, 1, 1, 1, .rgba, 0);
 
     const src: [4]u8 = @splat(1);
 
     // "r" past the end appends rather than failing, and reports the frame
     // it actually resolved to.
-    const far = try s.addAnimationFrame(alloc, 1, .{ .edit_frame = 99 }, &src, .rgba, 1, 1, 0);
+    const far = try s.addAnimationFrame(alloc, t.screens.active, 1, .{ .edit_frame = 99 }, &src, .rgba, 1, 1, 0);
     try testing.expectEqual(@as(u32, 2), far.frame);
 
     // The next frame number is an append too.
-    const next = try s.addAnimationFrame(alloc, 1, .{ .edit_frame = 3 }, &src, .rgba, 1, 1, 0);
+    const next = try s.addAnimationFrame(alloc, t.screens.active, 1, .{ .edit_frame = 3 }, &src, .rgba, 1, 1, 0);
     try testing.expectEqual(@as(u32, 3), next.frame);
     try testing.expectEqual(@as(usize, 2), s.images.getPtr(1).?.anim.?.frames.items.len);
 }
@@ -2562,7 +2590,7 @@ test "storage: animation frame errors leave storage untouched" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try testAddImage(&s, alloc, 1, 2, 2, .rgba, 4);
+    try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgba, 4);
 
     const bytes_before = s.total_bytes;
     const gen_before = s.generation;
@@ -2571,6 +2599,7 @@ test "storage: animation frame errors leave storage untouched" {
     const big: [3 * 3 * 4]u8 = @splat(1);
     try testing.expectError(error.InvalidRect, s.addAnimationFrame(
         alloc,
+        t.screens.active,
         1,
         .{},
         &big,
@@ -2584,6 +2613,7 @@ test "storage: animation frame errors leave storage untouched" {
     const src: [2 * 2 * 4]u8 = @splat(1);
     try testing.expectError(error.BaseFrameNotFound, s.addAnimationFrame(
         alloc,
+        t.screens.active,
         1,
         .{ .create_frame = 5 },
         &src,
@@ -2610,13 +2640,14 @@ test "storage: animation frame base canvas and background" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try testAddImage(&s, alloc, 1, 2, 1, .rgba, 8);
+    try testAddImage(&s, alloc, t.screens.active, 1, 2, 1, .rgba, 8);
 
     // A new frame based on the root starts as a copy of it, with the
     // transmitted rect composed over the left pixel only.
     const one: [4]u8 = .{ 1, 2, 3, 255 };
     _ = try s.addAnimationFrame(
         alloc,
+        t.screens.active,
         1,
         .{ .create_frame = 1, .composition_mode = .overwrite },
         &one,
@@ -2634,6 +2665,7 @@ test "storage: animation frame base canvas and background" {
     // With no base frame the canvas is the background color instead.
     _ = try s.addAnimationFrame(
         alloc,
+        t.screens.active,
         1,
         .{ .background = .{ .r = 9, .a = 255 }, .composition_mode = .overwrite },
         &one,
@@ -2657,16 +2689,16 @@ test "storage: retransmit clears animation" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try testAddImage(&s, alloc, 1, 2, 2, .rgba, 0);
+    try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgba, 0);
 
     const src: [2 * 2 * 4]u8 = @splat(7);
-    _ = try s.addAnimationFrame(alloc, 1, .{}, &src, .rgba, 2, 2, 0);
+    _ = try s.addAnimationFrame(alloc, t.screens.active, 1, .{}, &src, .rgba, 2, 2, 0);
     try testing.expectEqual(@as(usize, 1), s.animation_count);
     try testing.expectEqual(@as(usize, 32), s.total_bytes);
 
     // Retransmitting the same ID drops the animation entirely, and all of
     // its frame bytes with it.
-    try testAddImage(&s, alloc, 1, 2, 2, .rgba, 1);
+    try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgba, 1);
     try testing.expectEqual(@as(usize, 0), s.animation_count);
     try testing.expectEqual(@as(usize, 16), s.total_bytes);
     try testing.expect(s.images.getPtr(1).?.anim == null);
@@ -2680,10 +2712,10 @@ test "storage: deleting an image frees its frame bytes" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try testAddImage(&s, alloc, 1, 2, 2, .rgba, 0);
+    try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgba, 0);
 
     const src: [2 * 2 * 4]u8 = @splat(7);
-    _ = try s.addAnimationFrame(alloc, 1, .{}, &src, .rgba, 2, 2, 0);
+    _ = try s.addAnimationFrame(alloc, t.screens.active, 1, .{}, &src, .rgba, 2, 2, 0);
     try testing.expectEqual(@as(usize, 32), s.total_bytes);
 
     s.delete(alloc, &t, .{ .id = .{ .image_id = 1, .delete = true } });
@@ -2703,15 +2735,15 @@ test "storage: animation reservation evicts but excludes the target" {
 
     // Two 2x2 RGBA images is 32 bytes; the limit leaves room for exactly
     // one more frame.
-    try testAddImage(&s, alloc, 1, 2, 2, .rgba, 1);
-    try testAddImage(&s, alloc, 2, 2, 2, .rgba, 2);
+    try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgba, 1);
+    try testAddImage(&s, alloc, t.screens.active, 2, 2, 2, .rgba, 2);
     s.total_limit = 32;
 
     // Adding a frame to image 2 needs 16 bytes, which can only come from
     // evicting image 1: the target must never be evicted to make room for
     // its own frame.
     const src: [2 * 2 * 4]u8 = @splat(7);
-    _ = try s.addAnimationFrame(alloc, 2, .{}, &src, .rgba, 2, 2, 0);
+    _ = try s.addAnimationFrame(alloc, t.screens.active, 2, .{}, &src, .rgba, 2, 2, 0);
 
     try testing.expect(s.images.getPtr(1) == null);
     try testing.expectEqual(@as(usize, 32), s.total_bytes);
@@ -2726,7 +2758,7 @@ test "storage: animation frame over the limit fails cleanly" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try testAddImage(&s, alloc, 1, 2, 2, .rgba, 1);
+    try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgba, 1);
 
     // Only the target exists, and it can't be evicted for itself, so
     // there's no way to find room for the frame.
@@ -2734,6 +2766,7 @@ test "storage: animation frame over the limit fails cleanly" {
     const src: [2 * 2 * 4]u8 = @splat(7);
     try testing.expectError(error.OutOfSpace, s.addAnimationFrame(
         alloc,
+        t.screens.active,
         1,
         .{},
         &src,
@@ -2757,16 +2790,16 @@ test "storage: compose animation frames" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try testAddImage(&s, alloc, 1, 2, 1, .rgba, 0);
+    try testAddImage(&s, alloc, t.screens.active, 1, 2, 1, .rgba, 0);
 
     // Frame 2 is all 7s.
     const src: [2 * 1 * 4]u8 = @splat(7);
-    _ = try s.addAnimationFrame(alloc, 1, .{ .composition_mode = .overwrite }, &src, .rgba, 2, 1, 0);
+    _ = try s.addAnimationFrame(alloc, t.screens.active, 1, .{ .composition_mode = .overwrite }, &src, .rgba, 2, 1, 0);
 
     // Compose the left pixel of frame 2 (source, "r") onto the right
     // pixel of frame 1 (destination, "c"). The root is current, so this
     // changes what's on screen.
-    const visible = try s.composeAnimationFrames(alloc, 1, .{
+    const visible = try s.composeAnimationFrames(alloc, t.screens.active, 1, .{
         .edit_frame = 2,
         .frame = 1,
         .width = 1,
@@ -2793,27 +2826,27 @@ test "storage: compose animation frames validates" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try testAddImage(&s, alloc, 1, 2, 2, .rgba, 0);
+    try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgba, 0);
 
     // Missing source and destination frames.
-    try testing.expectError(error.FrameNotFound, s.composeAnimationFrames(alloc, 1, .{
+    try testing.expectError(error.FrameNotFound, s.composeAnimationFrames(alloc, t.screens.active, 1, .{
         .edit_frame = 0,
         .frame = 1,
     }, 0));
-    try testing.expectError(error.FrameNotFound, s.composeAnimationFrames(alloc, 1, .{
+    try testing.expectError(error.FrameNotFound, s.composeAnimationFrames(alloc, t.screens.active, 1, .{
         .edit_frame = 1,
         .frame = 9,
     }, 0));
 
     // A rect running off the image, in the source and in the dest.
-    try testing.expectError(error.InvalidRect, s.composeAnimationFrames(alloc, 1, .{
+    try testing.expectError(error.InvalidRect, s.composeAnimationFrames(alloc, t.screens.active, 1, .{
         .edit_frame = 1,
         .frame = 1,
         .width = 2,
         .height = 2,
         .left_edge = 1,
     }, 0));
-    try testing.expectError(error.InvalidRect, s.composeAnimationFrames(alloc, 1, .{
+    try testing.expectError(error.InvalidRect, s.composeAnimationFrames(alloc, t.screens.active, 1, .{
         .edit_frame = 1,
         .frame = 1,
         .width = 2,
@@ -2822,7 +2855,7 @@ test "storage: compose animation frames validates" {
     }, 0));
 
     // Composing a frame onto itself with overlapping rects.
-    try testing.expectError(error.InvalidRect, s.composeAnimationFrames(alloc, 1, .{
+    try testing.expectError(error.InvalidRect, s.composeAnimationFrames(alloc, t.screens.active, 1, .{
         .edit_frame = 1,
         .frame = 1,
         .width = 2,
@@ -2830,7 +2863,7 @@ test "storage: compose animation frames validates" {
     }, 0));
 
     // But the same frame with disjoint rects is fine.
-    _ = try s.composeAnimationFrames(alloc, 1, .{
+    _ = try s.composeAnimationFrames(alloc, t.screens.active, 1, .{
         .edit_frame = 1,
         .frame = 1,
         .width = 1,
@@ -2846,14 +2879,16 @@ test "storage: compose animation frames validates" {
 fn testAddAnimatedImage(
     s: *ImageStorage,
     alloc: Allocator,
+    screen: *terminal.Screen,
     id: u32,
     extra: u8,
 ) !void {
-    try testAddImage(s, alloc, id, 1, 1, .rgba, 1);
+    try testAddImage(s, alloc, screen, id, 1, 1, .rgba, 1);
     for (0..extra) |i| {
         const src: [4]u8 = @splat(@intCast(i + 2));
         _ = try s.addAnimationFrame(
             alloc,
+            screen,
             id,
             .{ .composition_mode = .overwrite },
             &src,
@@ -2873,7 +2908,7 @@ test "storage: delete animation frame identifiers" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try testAddAnimatedImage(&s, alloc, 1, 1);
+    try testAddAnimatedImage(&s, alloc, t.screens.active, 1, 1);
 
     // An ID and a number together is malformed.
     try testing.expectEqual(ImageStorage.FrameDeleteResult.invalid_identifiers, s.deleteAnimationFrame(
@@ -2907,7 +2942,7 @@ test "storage: delete animation frame with no frames" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try testAddImage(&s, alloc, 1, 1, 1, .rgba, 1);
+    try testAddImage(&s, alloc, t.screens.active, 1, 1, 1, .rgba, 1);
     try s.addPlacement(alloc, 1, 0, .{
         .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
     });
@@ -2943,7 +2978,7 @@ test "storage: delete animation root frame promotes" {
     defer s.deinit(alloc, t.screens.active);
 
     // Root=1, frame 2=2, frame 3=3, each 4 bytes.
-    try testAddAnimatedImage(&s, alloc, 1, 2);
+    try testAddAnimatedImage(&s, alloc, t.screens.active, 1, 2);
     try testing.expectEqual(@as(usize, 12), s.total_bytes);
 
     const img = s.images.getPtr(1).?;
@@ -2984,7 +3019,7 @@ test "storage: delete animation root frame keeping current pixels" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try testAddAnimatedImage(&s, alloc, 1, 2);
+    try testAddAnimatedImage(&s, alloc, t.screens.active, 1, 2);
 
     const img = s.images.getPtr(1).?;
 
@@ -3019,7 +3054,7 @@ test "storage: delete animation frame current index rules" {
     {
         var s: ImageStorage = .{};
         defer s.deinit(alloc, t.screens.active);
-        try testAddAnimatedImage(&s, alloc, 1, 2);
+        try testAddAnimatedImage(&s, alloc, t.screens.active, 1, 2);
         const img = s.images.getPtr(1).?;
         img.anim.?.current_frame = 2; // frame 3
 
@@ -3033,7 +3068,7 @@ test "storage: delete animation frame current index rules" {
     {
         var s: ImageStorage = .{};
         defer s.deinit(alloc, t.screens.active);
-        try testAddAnimatedImage(&s, alloc, 1, 2);
+        try testAddAnimatedImage(&s, alloc, t.screens.active, 1, 2);
         const img = s.images.getPtr(1).?;
         img.anim.?.current_frame = 1; // frame 2
 
@@ -3047,7 +3082,7 @@ test "storage: delete animation frame current index rules" {
     {
         var s: ImageStorage = .{};
         defer s.deinit(alloc, t.screens.active);
-        try testAddAnimatedImage(&s, alloc, 1, 2);
+        try testAddAnimatedImage(&s, alloc, t.screens.active, 1, 2);
         const img = s.images.getPtr(1).?;
         img.anim.?.current_frame = 2; // frame 3
         const gen_before = img.generation;
@@ -3064,7 +3099,7 @@ test "storage: delete animation frame current index rules" {
     {
         var s: ImageStorage = .{};
         defer s.deinit(alloc, t.screens.active);
-        try testAddAnimatedImage(&s, alloc, 1, 1);
+        try testAddAnimatedImage(&s, alloc, t.screens.active, 1, 1);
         const img = s.images.getPtr(1).?;
         img.anim.?.current_frame = 1;
 
@@ -3083,7 +3118,7 @@ test "storage: delete animation frame clamps" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try testAddAnimatedImage(&s, alloc, 1, 2);
+    try testAddAnimatedImage(&s, alloc, t.screens.active, 1, 2);
     const img = s.images.getPtr(1).?;
 
     // Out of range clamps onto the last frame rather than failing.
@@ -3106,7 +3141,7 @@ fn testAddPlayableImage(
     id: u32,
     extra: u8,
 ) !void {
-    try testAddAnimatedImage(s, alloc, id, extra);
+    try testAddAnimatedImage(s, alloc, t.screens.active, id, extra);
     try s.addPlacement(alloc, id, 0, .{
         .location = .{ .pin = try trackPin(t, .{ .x = 0, .y = 0 }) },
     });
@@ -3171,7 +3206,7 @@ test "storage: animation tick is dormant without a placement" {
     defer s.deinit(alloc, t.screens.active);
 
     // Same as a playable image but with no placement.
-    try testAddAnimatedImage(&s, alloc, 1, 1);
+    try testAddAnimatedImage(&s, alloc, t.screens.active, 1, 1);
     const anim = s.images.getPtr(1).?.anim.?;
     anim.state = .running;
     anim.setGap(0, 100);
@@ -3217,7 +3252,7 @@ test "storage: animation tick with no animations early-outs" {
 
     var s: ImageStorage = .{};
     defer s.deinit(alloc, t.screens.active);
-    try testAddImage(&s, alloc, 1, 1, 1, .rgba, 1);
+    try testAddImage(&s, alloc, t.screens.active, 1, 1, 1, .rgba, 1);
 
     try testing.expectEqual(@as(usize, 0), s.animation_count);
     try testing.expectEqual(@as(?u64, null), s.nextAnimationDeadline());
@@ -3336,6 +3371,7 @@ test "storage: animation tick waits at the tail while loading" {
     const src: [4]u8 = @splat(9);
     _ = try s.addAnimationFrame(
         alloc,
+        t.screens.active,
         1,
         .{ .composition_mode = .overwrite },
         &src,
@@ -3392,4 +3428,66 @@ test "storage: animation deadline picks the earliest" {
     try testing.expectEqual(@as(u32, 0), s.images.getPtr(1).?.anim.?.current_frame);
     try testing.expectEqual(@as(u32, 1), s.images.getPtr(2).?.anim.?.current_frame);
     try testing.expectEqual(@as(?u64, 350), r.next_due_ms);
+}
+
+test "storage: eviction releases placement pins" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+    const baseline = t.screens.active.pages.countTrackedPins();
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    // Evicting an image must release the pins its placements tracked, or
+    // PageList accumulates them forever and every page update gets slower.
+    for (0..8) |_| {
+        try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgba, 1);
+        try s.addPlacement(alloc, 1, 0, .{
+            .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
+        });
+        try s.addPlacement(alloc, 1, 0, .{
+            .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) },
+        });
+
+        // Lowering the limit below what's resident evicts, which must
+        // release the evicted image's placement pins.
+        try s.setLimit(alloc, t.screens.active, 8);
+        try testing.expect(s.images.getPtr(1) == null);
+        try testing.expectEqual(baseline, t.screens.active.pages.countTrackedPins());
+
+        try s.setLimit(alloc, t.screens.active, 320 * 1000 * 1000);
+    }
+}
+
+test "storage: animation reservation eviction releases placement pins" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+    const baseline = t.screens.active.pages.countTrackedPins();
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    for (0..8) |_| {
+        // Image 1 is the eviction victim, image 2 the frame target.
+        try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgba, 1);
+        try s.addPlacement(alloc, 1, 0, .{
+            .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) },
+        });
+        try testAddImage(&s, alloc, t.screens.active, 2, 2, 2, .rgba, 2);
+        s.total_limit = 32;
+
+        const src: [2 * 2 * 4]u8 = @splat(7);
+        _ = try s.addAnimationFrame(alloc, t.screens.active, 2, .{}, &src, .rgba, 2, 2, 0);
+        try testing.expect(s.images.getPtr(1) == null);
+
+        // The evicted image's placement pin must be released too.
+        try testing.expectEqual(baseline, t.screens.active.pages.countTrackedPins());
+
+        s.total_limit = 320 * 1000 * 1000;
+        s.delete(alloc, &t, .{ .all = true });
+    }
 }
