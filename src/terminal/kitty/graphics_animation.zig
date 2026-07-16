@@ -177,6 +177,79 @@ pub const Animation = struct {
     }
 };
 
+/// The region of an image whose pixels changed since the renderer last
+/// uploaded it.
+///
+/// Live clients (VNC, video) send small rectangles, and uploading a whole
+/// 1080p texture to move a cursor throws that away. This is deliberately
+/// coarse -- nothing, one bounding rectangle, or everything -- because a
+/// bounding box costs one upload and a set of disjoint rectangles costs
+/// several, and at these sizes the extra uploads lose to the extra bytes
+/// well before the box gets loose.
+///
+/// Damage accumulates until the renderer *acknowledges* it, not until it
+/// is next read: if an upload fails, the union must still describe
+/// everything that changed since the last good upload.
+pub const Damage = union(enum) {
+    /// Nothing changed since the last upload.
+    none,
+
+    /// Everything changed, or tracking it exactly stopped being worth it.
+    full,
+
+    /// This rectangle covers every change.
+    rect: Rect,
+
+    pub const Rect = struct {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+
+        fn right(self: Rect) u32 {
+            return self.x + self.width;
+        }
+
+        fn bottom(self: Rect) u32 {
+            return self.y + self.height;
+        }
+    };
+
+    /// Add a changed rectangle, growing to cover both.
+    pub fn add(self: *Damage, r: Rect) void {
+        if (r.width == 0 or r.height == 0) return;
+        switch (self.*) {
+            .full => {},
+            .none => self.* = .{ .rect = r },
+            .rect => |cur| {
+                const x = @min(cur.x, r.x);
+                const y = @min(cur.y, r.y);
+                self.* = .{ .rect = .{
+                    .x = x,
+                    .y = y,
+                    .width = @max(cur.right(), r.right()) - x,
+                    .height = @max(cur.bottom(), r.bottom()) - y,
+                } };
+            },
+        }
+    }
+
+    /// Mark everything changed.
+    pub fn addFull(self: *Damage) void {
+        self.* = .full;
+    }
+
+    /// The rectangle to upload for an image of these dimensions, or null
+    /// if there is nothing to upload.
+    pub fn region(self: Damage, width: u32, height: u32) ?Rect {
+        return switch (self) {
+            .none => null,
+            .full => .{ .x = 0, .y = 0, .width = width, .height = height },
+            .rect => |r| r,
+        };
+    }
+};
+
 /// The gap to store for a "z" value on an existing frame. A negative gap
 /// means the frame is gapless, which we store as a zero gap.
 pub fn resolveGap(z: i32) u32 {
@@ -654,5 +727,65 @@ test "animation: allocRGBA widening" {
         const out = try allocRGBA(alloc, &.{ 1, 2, 3, 4 }, .rgba);
         defer alloc.free(out);
         try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, out);
+    }
+}
+
+test "animation: damage accumulates and coalesces" {
+    const testing = std.testing;
+
+    var d: Damage = .none;
+    try testing.expectEqual(@as(?Damage.Rect, null), d.region(100, 100));
+
+    // A single rectangle is itself.
+    d.add(.{ .x = 10, .y = 10, .width = 5, .height = 5 });
+    try testing.expectEqual(
+        Damage.Rect{ .x = 10, .y = 10, .width = 5, .height = 5 },
+        d.region(100, 100).?,
+    );
+
+    // A second one grows the box to cover both: never replace, or the
+    // earlier change would be dropped if it hasn't been uploaded yet.
+    d.add(.{ .x = 20, .y = 30, .width = 5, .height = 5 });
+    try testing.expectEqual(
+        Damage.Rect{ .x = 10, .y = 10, .width = 15, .height = 25 },
+        d.region(100, 100).?,
+    );
+
+    // Overlapping adds nothing new.
+    d.add(.{ .x = 12, .y = 12, .width = 2, .height = 2 });
+    try testing.expectEqual(
+        Damage.Rect{ .x = 10, .y = 10, .width = 15, .height = 25 },
+        d.region(100, 100).?,
+    );
+
+    // Empty rectangles are not damage.
+    var e: Damage = .none;
+    e.add(.{ .x = 5, .y = 5, .width = 0, .height = 3 });
+    try testing.expect(e == .none);
+
+    // Full swallows everything and stays full.
+    d.addFull();
+    d.add(.{ .x = 0, .y = 0, .width = 1, .height = 1 });
+    try testing.expectEqual(
+        Damage.Rect{ .x = 0, .y = 0, .width = 100, .height = 100 },
+        d.region(100, 100).?,
+    );
+}
+
+test "animation: damage covers every edge" {
+    const testing = std.testing;
+
+    // A rectangle at each corner and edge must round-trip exactly: an
+    // off-by-one here uploads the wrong pixels.
+    for ([_]Damage.Rect{
+        .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+        .{ .x = 99, .y = 0, .width = 1, .height = 1 },
+        .{ .x = 0, .y = 99, .width = 1, .height = 1 },
+        .{ .x = 99, .y = 99, .width = 1, .height = 1 },
+        .{ .x = 0, .y = 0, .width = 100, .height = 100 },
+    }) |r| {
+        var d: Damage = .none;
+        d.add(r);
+        try testing.expectEqual(r, d.region(100, 100).?);
     }
 }

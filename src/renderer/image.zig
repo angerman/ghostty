@@ -224,6 +224,8 @@ pub const State = struct {
             .overlay,
             generation,
             pending,
+            // Overlays are rebuilt whole; they have no damage tracking.
+            null,
         );
         errdefer comptime unreachable;
 
@@ -449,14 +451,19 @@ pub const State = struct {
         defer storage.pixel_dirty = false;
 
         for (self.kitty_visible.keys()) |id| {
-            const img = storage.imageById(id) orelse continue;
-            self.prepKittyImage(alloc, &img) catch |err| {
-                // Leave pixel_dirty set for a retry rather than losing the
-                // change: the deferred clear above is the only reason this
-                // needs saying, so undo it.
+            const img = storage.images.getPtr(id) orelse continue;
+            self.prepKittyImage(alloc, img) catch |err| {
+                // Leave pixel_dirty set, and the damage un-acknowledged,
+                // so the next frame retries the whole accumulated region
+                // rather than losing the part of it that failed.
                 storage.pixel_dirty = true;
                 log.warn("error preparing kitty image id={} err={}", .{ id, err });
+                continue;
             };
+
+            // Staged successfully: everything up to here is accounted for,
+            // so start accumulating again from nothing.
+            img.damage = .none;
         }
     }
 
@@ -596,6 +603,11 @@ pub const State = struct {
         id: Id,
         generation: u64,
         pending: Image.Pending,
+        /// The region of `pending` that actually changed, or null for all
+        /// of it. Only honored when a texture of the right shape already
+        /// exists: the first upload of an image has to be whole, because
+        /// a region cannot create a texture.
+        damage: ?Image.Damage.Rect,
     ) PrepImageError!void {
         // If this image exists and its generation is the same it is the
         // identical image so we don't need to send it to the GPU.
@@ -617,9 +629,26 @@ pub const State = struct {
             .staging = &.{},
         };
 
-        const src = pending.dataSlice();
-        if (gop.value_ptr.staging.len < src.len) {
-            const grown = alloc.realloc(gop.value_ptr.staging, src.len) catch {
+        // Decide whether this can be a partial upload before staging,
+        // because a partial stages only the damaged rows.
+        const region = Image.stagedRegion(
+            if (gop.value_ptr.image.getTexture()) |tex| .{
+                .width = tex.width,
+                .height = tex.height,
+            } else null,
+            pending,
+            damage,
+        );
+
+        const bpp = pending.pixel_format.bpp();
+        const stride = pending.width * bpp;
+        const staged_len: usize = if (region) |r|
+            @as(usize, r.width) * r.height * bpp
+        else
+            pending.dataSlice().len;
+
+        if (gop.value_ptr.staging.len < staged_len) {
+            const grown = alloc.realloc(gop.value_ptr.staging, staged_len) catch {
                 if (!gop.found_existing) {
                     // If this is a new entry we can just remove it since it
                     // was never sent to the GPU.
@@ -634,18 +663,33 @@ pub const State = struct {
             };
             gop.value_ptr.staging = grown;
         }
-        const data = gop.value_ptr.staging[0..src.len];
-        @memcpy(data, src);
+        const data = gop.value_ptr.staging[0..staged_len];
+        if (region) |r| {
+            // Pack the damaged rows tightly: replaceRegion takes the
+            // region's own rows, not a window into the full image.
+            const src_all = pending.data;
+            for (0..r.height) |row| {
+                const src_off = (@as(usize, r.y) + row) * stride + @as(usize, r.x) * bpp;
+                const dst_off = row * r.width * bpp;
+                @memcpy(
+                    data[dst_off..][0 .. r.width * bpp],
+                    src_all[src_off..][0 .. r.width * bpp],
+                );
+            }
+        } else {
+            @memcpy(data, pending.dataSlice());
+        }
 
         // Store it in the map. The pending pixels are borrowed from the
         // staging above, so nothing frees them but the entry itself.
         const new_image: Image = .{
             .pending = .{
-                .width = pending.width,
-                .height = pending.height,
+                .width = if (region) |r| r.width else pending.width,
+                .height = if (region) |r| r.height else pending.height,
                 .pixel_format = pending.pixel_format,
                 .data = data.ptr,
                 .owned = false,
+                .dest = if (region) |r| .{ .x = r.x, .y = r.y } else null,
             },
         };
         if (!gop.found_existing) {
@@ -706,6 +750,7 @@ pub const State = struct {
                 // buffer.
                 .data = @constCast(data.ptr),
             },
+            image.damage.region(image.width, image.height),
         );
     }
 };
@@ -833,6 +878,11 @@ pub const Image = union(enum) {
     };
 
     /// Pending image data that needs to be uploaded to the GPU.
+    pub const Origin = struct { x: u32, y: u32 };
+
+    /// The damage description the terminal side produces.
+    pub const Damage = terminal.kitty.graphics.Damage;
+
     pub const Pending = struct {
         height: u32,
         width: u32,
@@ -840,6 +890,15 @@ pub const Image = union(enum) {
 
         /// Data is always expected to be (width * height * bpp).
         data: [*]u8,
+
+        /// Where these pixels belong in the texture.
+        ///
+        /// Null means they are the whole image, which is the only thing
+        /// that can create a texture. A non-null origin means this is a
+        /// partial update of a texture that already exists: `width` and
+        /// `height` are the damaged region's, not the image's, and `data`
+        /// is that region's rows tightly packed.
+        dest: ?Origin = null,
 
         /// Whether `data` is owned by this Image and must be freed with
         /// it.
@@ -1026,10 +1085,18 @@ pub const Image = union(enum) {
         // with the same options, so matching dimensions is enough to know
         // the existing texture can hold these pixels.
         if (self.getTexture()) |existing| {
-            if (textureFits(existing.width, existing.height, p)) {
+            // A partial update always replaces a region: prepImage only
+            // produces one when a texture of the right shape exists.
+            const origin: ?Origin = p.dest orelse
+                if (textureFits(existing.width, existing.height, p))
+                    .{ .x = 0, .y = 0 }
+                else
+                    null;
+
+            if (origin) |o| {
                 existing.replaceRegion(
-                    0,
-                    0,
+                    o.x,
+                    o.y,
                     p.width,
                     p.height,
                     p.dataSlice(),
@@ -1069,6 +1136,31 @@ pub const Image = union(enum) {
         //       texture cannot hold the new pixels.
         self.deinit(alloc);
         self.* = .{ .ready = texture };
+    }
+
+    /// The region to stage and upload, or null to upload the whole image.
+    ///
+    /// A region can only ever *update* a texture, so the first upload of an
+    /// image is always whole however little of it changed, and so is one
+    /// whose shape just changed. A region covering everything is a full
+    /// upload too: the full path stages one contiguous copy instead of
+    /// row by row.
+    ///
+    /// Split out from prepImage so the rule can be tested without a GPU:
+    /// a partial upload by definition needs a texture to already exist.
+    fn stagedRegion(
+        texture: ?struct { width: usize, height: usize },
+        pending: Image.Pending,
+        damage: ?Image.Damage.Rect,
+    ) ?Image.Damage.Rect {
+        const r = damage orelse return null;
+        if (r.width == 0 or r.height == 0) return null;
+
+        const tex = texture orelse return null;
+        if (tex.width != pending.width or tex.height != pending.height) return null;
+        if (r.width == pending.width and r.height == pending.height) return null;
+
+        return r;
     }
 
     /// Whether pixels of the pending shape can be uploaded into an
@@ -1390,4 +1482,150 @@ test "kitty: scrolling out of view stops scheduling" {
     try testing.expect(!r.dirtied);
     try testing.expectEqual(@as(?u64, null), r.next_due_ms);
     try testing.expect(!state.kittyRequiresPixelUpdate(&t));
+}
+
+test "kitty: a small edit uploads only its damage" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 100;
+
+    const storage = &t.screens.active.kitty_images;
+
+    // An 8x8 RGBA image, placed.
+    const data = try alloc.alloc(u8, 8 * 8 * 4);
+    @memset(data, 1);
+    {
+        errdefer alloc.free(data);
+        try storage.addImage(alloc, t.screens.active, .{
+            .id = 1,
+            .width = 8,
+            .height = 8,
+            .format = .rgba,
+            .data = data,
+        });
+    }
+    const pin = try t.screens.active.pages.trackPin(
+        t.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
+    );
+    try storage.addPlacement(alloc, 1, 0, .{ .location = .{ .pin = pin } });
+
+    var state: State = .empty;
+    defer state.deinit(alloc);
+
+    // First synchronization uploads the whole image: there is no texture
+    // to update a region of yet.
+    state.kittyUpdatePlacements(alloc, &t, .{ .width = 10, .height = 10 });
+    try testing.expect(storage.images.getPtr(1).?.damage == .none);
+
+    // Edit a 2x2 corner of the current (root) frame, the way a VNC client
+    // sends a cursor-sized update.
+    const src: [2 * 2 * 4]u8 = @splat(9);
+    _ = try storage.addAnimationFrame(
+        alloc,
+        t.screens.active,
+        1,
+        .{ .edit_frame = 1, .x = 5, .y = 3, .composition_mode = .overwrite },
+        &src,
+        .rgba,
+        2,
+        2,
+        0,
+    );
+
+    // The damage is exactly what was composed, not the whole image.
+    try testing.expectEqual(
+        terminal.kitty.graphics.Damage.Rect{ .x = 5, .y = 3, .width = 2, .height = 2 },
+        storage.images.getPtr(1).?.damage.region(8, 8).?,
+    );
+
+    // A second edit elsewhere accumulates rather than replacing: the
+    // first one has not been uploaded yet.
+    _ = try storage.addAnimationFrame(
+        alloc,
+        t.screens.active,
+        1,
+        .{ .edit_frame = 1, .x = 0, .y = 0, .composition_mode = .overwrite },
+        &src,
+        .rgba,
+        2,
+        2,
+        0,
+    );
+    try testing.expectEqual(
+        terminal.kitty.graphics.Damage.Rect{ .x = 0, .y = 0, .width = 7, .height = 5 },
+        storage.images.getPtr(1).?.damage.region(8, 8).?,
+    );
+
+    // Synchronizing pixels acknowledges the damage, so the next edit
+    // starts accumulating from nothing again.
+    state.kittyUpdatePixels(alloc, &t);
+    try testing.expect(storage.images.getPtr(1).?.damage == .none);
+
+    // Note this upload is whole despite the small damage, and correctly
+    // so: there is no texture yet to update a region of. These tests have
+    // no GPU, so the region decision itself is covered by the unit test
+    // for stagedRegion below.
+    const entry = state.images.get(.{ .kitty = 1 }).?;
+    const pending = entry.image.getPending().?;
+    try testing.expectEqual(@as(u32, 8), pending.width);
+    try testing.expectEqual(@as(?Image.Origin, null), pending.dest);
+}
+
+test "kitty: only a real region of an existing texture is staged" {
+    const testing = std.testing;
+    var bytes: [8 * 8 * 4]u8 = @splat(0);
+    const p: Image.Pending = .{
+        .width = 8,
+        .height = 8,
+        .pixel_format = .rgba,
+        .data = &bytes,
+    };
+    const small: Image.Damage.Rect = .{ .x = 1, .y = 1, .width = 2, .height = 2 };
+
+    // The common case: a texture of the right shape and a small change.
+    try testing.expectEqual(small, Image.stagedRegion(
+        .{ .width = 8, .height = 8 },
+        p,
+        small,
+    ).?);
+
+    // No texture yet: a region cannot create one, so upload it all.
+    try testing.expectEqual(@as(?Image.Damage.Rect, null), Image.stagedRegion(
+        null,
+        p,
+        small,
+    ));
+
+    // The shape changed: the old texture cannot take these pixels.
+    try testing.expectEqual(@as(?Image.Damage.Rect, null), Image.stagedRegion(
+        .{ .width = 4, .height = 8 },
+        p,
+        small,
+    ));
+
+    // No damage recorded means upload it all.
+    try testing.expectEqual(@as(?Image.Damage.Rect, null), Image.stagedRegion(
+        .{ .width = 8, .height = 8 },
+        p,
+        null,
+    ));
+
+    // Damage covering the whole image is a full upload: staging it row by
+    // row would be the same bytes and more work.
+    try testing.expectEqual(@as(?Image.Damage.Rect, null), Image.stagedRegion(
+        .{ .width = 8, .height = 8 },
+        p,
+        .{ .x = 0, .y = 0, .width = 8, .height = 8 },
+    ));
+
+    // An empty rectangle is not damage.
+    try testing.expectEqual(@as(?Image.Damage.Rect, null), Image.stagedRegion(
+        .{ .width = 8, .height = 8 },
+        p,
+        .{ .x = 0, .y = 0, .width = 0, .height = 4 },
+    ));
 }

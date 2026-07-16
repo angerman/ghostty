@@ -678,7 +678,8 @@ fn controlAnimation(
     // -- gaps, playback state, loop counts -- only affects *when* a frame
     // is shown, so it costs a reschedule and nothing more. Neither can
     // move a placement, so neither invalidates layout.
-    if (visible) storage.markPixelsMutated(img, true);
+    // Switching the current frame swaps in an unrelated buffer.
+    if (visible) storage.markPixelsMutated(img, true, .full);
     storage.markScheduleMutated();
 
     // Kitty sends no response at all for a successful animation control.

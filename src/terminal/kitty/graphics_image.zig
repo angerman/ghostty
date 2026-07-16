@@ -7,7 +7,8 @@ const posix = std.posix;
 
 const fastmem = @import("../../fastmem.zig");
 const command = @import("graphics_command.zig");
-const Animation = @import("graphics_animation.zig").Animation;
+const animation = @import("graphics_animation.zig");
+const Animation = animation.Animation;
 const PageList = @import("../PageList.zig");
 const sys = @import("../sys.zig");
 
@@ -592,6 +593,16 @@ pub const Image = struct {
     /// costs one field read per animated image rather than a walk of every
     /// placement.
     drawn: bool = false,
+
+    /// What changed in the displayed pixels since the renderer last
+    /// uploaded them.
+    ///
+    /// Set by whatever mutates the current frame and cleared only when an
+    /// upload of it succeeds, so a failed upload retries the whole union
+    /// rather than losing the earlier part of it. A client sending small
+    /// rectangles (VNC, a video codec's deltas) uploads only what it
+    /// actually changed.
+    damage: animation.Damage = .none,
 
     /// Unique, monotonically increasing stamp assigned each time an
     /// image is added to (or replaced in) an ImageStorage. A changed

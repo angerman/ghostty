@@ -249,11 +249,21 @@ pub const ImageStorage = struct {
         self: *ImageStorage,
         img: *Image,
         visible: bool,
+        damage: animation.Damage,
     ) void {
         self.generation = nextGeneration();
         if (!visible) return;
         img.generation = self.generation;
         self.pixel_dirty = true;
+
+        // Accumulate rather than replace: the renderer may not have
+        // uploaded the previous change yet, and it must not upload a
+        // region that omits it.
+        switch (damage) {
+            .none => {},
+            .full => img.damage.addFull(),
+            .rect => |r| img.damage.add(r),
+        }
     }
 
     /// Record that animation timing changed. This has no pixel or
@@ -554,7 +564,11 @@ pub const ImageStorage = struct {
                 // The heart of the fast path: advancing a frame changes
                 // pixels only. It must never invalidate layout, or every
                 // tick would rebuild and re-sort every placement.
-                self.markPixelsMutated(img, true);
+                // A switch between two materialized frames changes
+                // everything: nothing here knows how they differ. The
+                // tiled-surface work would derive this from tile
+                // identity; until then it is a full upload.
+                self.markPixelsMutated(img, true, .full);
                 result.dirtied = true;
 
                 next_at = now_ms +| anim.gapOf(anim.current_frame);
@@ -937,7 +951,20 @@ pub const ImageStorage = struct {
         // Only a change to the frame on screen costs the renderer an
         // upload; a stored-only change costs nothing until it displays.
         const visible = !is_new and frame - 1 == anim.current_frame;
-        self.markPixelsMutated(img, visible);
+        self.markPixelsMutated(img, visible, damage: {
+            // We know exactly what we composed: the transmitted rectangle
+            // at its destination, clipped the same way composition
+            // clipped it. This is the case a VNC or video client hits on
+            // every frame, so uploading the whole canvas would throw away
+            // the very thing that makes those clients cheap.
+            if (params.x >= img.width or params.y >= img.height) break :damage .none;
+            break :damage .{ .rect = .{
+                .x = params.x,
+                .y = params.y,
+                .width = @min(rect_width, img.width - params.x),
+                .height = @min(rect_height, img.height - params.y),
+            } };
+        });
         if (visible) {
             // Editing the visible frame restarts its gap interval, so it
             // stays up for the full new gap rather than a leftover slice.
@@ -1088,7 +1115,16 @@ pub const ImageStorage = struct {
             dst_frame - 1 == anim.current_frame
         else
             true;
-        self.markPixelsMutated(img, visible);
+        self.markPixelsMutated(img, visible, .{
+            .rect = .{
+                // The destination rectangle is validated to be inside the
+                // image, so it is exactly the damage.
+                .x = params.x,
+                .y = params.y,
+                .width = w,
+                .height = h,
+            },
+        });
         if (visible) {
             if (img.anim) |anim| {
                 anim.last_frame_ms = now_ms;
@@ -1192,7 +1228,7 @@ pub const ImageStorage = struct {
         // have, so this is the pixel domain. Only stamp the image when
         // what is actually on screen changed.
         const changed = before != @intFromPtr(img.renderData().ptr);
-        self.markPixelsMutated(img, changed);
+        self.markPixelsMutated(img, changed, .full);
         if (changed) anim.last_frame_ms = now_ms;
         self.markScheduleMutated();
 

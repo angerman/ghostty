@@ -40,6 +40,7 @@ const image = @import("graphics_image.zig");
 const storage = @import("graphics_storage.zig");
 pub const unicode = @import("graphics_unicode.zig");
 pub const Animation = animation.Animation;
+pub const Damage = animation.Damage;
 pub const Command = command.Command;
 pub const CommandParser = command.Parser;
 pub const Image = image.Image;
