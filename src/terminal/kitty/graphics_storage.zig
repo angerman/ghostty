@@ -786,12 +786,16 @@ pub const ImageStorage = struct {
             return error.BaseFrameNotFound;
         }
 
-        // Every composition is RGBA-on-RGBA, so the root frame is widened
-        // on the first command that touches frame pixels and stays RGBA
-        // from then on. We also need a fresh root buffer when editing the
-        // root frame, so that a failure can't leave it half-composed.
+        // Composition is RGBA-on-RGBA, so the root is widened when this
+        // operation actually involves it: as the frame being edited, or as
+        // the base a new frame is copied from. An operation that touches
+        // neither -- a new frame from a background, or from another frame
+        // -- must leave an RGB root alone rather than growing it to RGBA
+        // for nothing. Editing the root also needs a fresh buffer even if
+        // it already is RGBA, so a failure can't leave it half-composed.
         const root_is_target = !is_new and frame == 1;
-        const need_root = img.format != .rgba or root_is_target;
+        const root_is_base = is_new and params.create_frame == 1;
+        const need_root = root_is_target or (root_is_base and img.format != .rgba);
         const root_growth: usize = if (need_root) canvas_len - img.data.len else 0;
 
         // Preflight the transient cost before allocating any of it: the
@@ -998,9 +1002,12 @@ pub const ImageStorage = struct {
         // the destination is composed as a fresh buffer so that a failure
         // can't leave a frame half written. When the destination is the
         // root frame, that fresh buffer is also its widened copy.
+        // As above: widen the root only when this composition reads or
+        // writes it.
         const root_is_target = dst_frame == 1;
-        const need_root = img.format != .rgba or root_is_target;
-        const root_growth: usize = if (img.format != .rgba)
+        const root_is_source = src_frame == 1;
+        const need_root = root_is_target or (root_is_source and img.format != .rgba);
+        const root_growth: usize = if (need_root and img.format != .rgba)
             canvas_len - img.data.len
         else
             0;
@@ -2607,7 +2614,7 @@ test "storage: animation frame append" {
     try testing.expectEqualSlices(u8, img.data, img.renderData());
 }
 
-test "storage: animation frame widens the root" {
+test "storage: the root is widened only when it is involved" {
     const testing = std.testing;
     const alloc = testing.allocator;
     var t = try terminal.Terminal.init(alloc, .{ .rows = 3, .cols = 3 });
@@ -2620,27 +2627,51 @@ test "storage: animation frame widens the root" {
     try testAddImage(&s, alloc, t.screens.active, 1, 2, 2, .rgb, 3);
     try testing.expectEqual(@as(usize, 12), s.total_bytes);
 
+    // A frame with no base frame is composed onto the background, so it
+    // never reads the root. Widening the root here would grow an
+    // untouched image from 12 to 16 bytes for nothing.
     const src: [2 * 2 * 3]u8 = @splat(9);
     _ = try s.addAnimationFrame(alloc, t.screens.active, 1, .{}, &src, .rgb, 2, 2, 0);
+    {
+        const img = s.images.getPtr(1).?;
+        try testing.expectEqual(command.Transmission.Format.rgb, img.format);
+        try testing.expectEqual(@as(usize, 12), img.data.len);
+        try testing.expectEqual(@as(usize, 12 + 16), s.total_bytes);
 
-    // The root is widened to RGBA once, and both it and the new frame are
-    // charged: 16 + 16.
-    const img = s.images.getPtr(1).?;
-    try testing.expectEqual(command.Transmission.Format.rgba, img.format);
-    try testing.expectEqual(@as(usize, 32), s.total_bytes);
-    try testing.expectEqual(@as(usize, 32), img.byteSize());
-    try testing.expectEqualSlices(
-        u8,
-        &.{ 3, 3, 3, 255, 3, 3, 3, 255, 3, 3, 3, 255, 3, 3, 3, 255 },
-        img.data,
-    );
+        // The transmitted RGB rect is still widened into the frame.
+        try testing.expectEqualSlices(
+            u8,
+            &.{ 9, 9, 9, 255, 9, 9, 9, 255, 9, 9, 9, 255, 9, 9, 9, 255 },
+            img.anim.?.frames.items[0].data,
+        );
 
-    // The transmitted RGB rect is widened too.
-    try testing.expectEqualSlices(
-        u8,
-        &.{ 9, 9, 9, 255, 9, 9, 9, 255, 9, 9, 9, 255, 9, 9, 9, 255 },
-        img.anim.?.frames.items[0].data,
+        // The root is what's on screen, and it is still RGB.
+        try testing.expectEqual(command.Transmission.Format.rgb, img.renderFormat());
+    }
+
+    // Basing a new frame on the root does read it, so now it widens.
+    _ = try s.addAnimationFrame(
+        alloc,
+        t.screens.active,
+        1,
+        .{ .create_frame = 1 },
+        &src,
+        .rgb,
+        2,
+        2,
+        0,
     );
+    {
+        const img = s.images.getPtr(1).?;
+        try testing.expectEqual(command.Transmission.Format.rgba, img.format);
+        try testing.expectEqualSlices(
+            u8,
+            &.{ 3, 3, 3, 255, 3, 3, 3, 255, 3, 3, 3, 255, 3, 3, 3, 255 },
+            img.data,
+        );
+        try testing.expectEqual(command.Transmission.Format.rgba, img.renderFormat());
+    }
+    try expectAccountingExact(&s);
 }
 
 test "storage: animation frame edit" {
