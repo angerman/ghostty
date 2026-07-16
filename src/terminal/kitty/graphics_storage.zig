@@ -4126,3 +4126,127 @@ test "storage: malformed dimensions do not wrap" {
         .left_edge = 1,
     }, 0));
 }
+
+test "storage: a bounded frame ring streams indefinitely at constant cost" {
+    const testing = std.testing;
+    var counting: CountingAlloc = .{ .parent = testing.allocator };
+    const alloc = counting.allocator();
+
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    // The bounded-ring shape a video or VNC client uses: a fixed set of
+    // protocol frames, rewritten forever. Memory must be constant for an
+    // indefinite stream, and the steady state must not allocate at all.
+    const dim = 32;
+    try testAddImage(&s, alloc, t.screens.active, 1, dim, dim, .rgba, 0);
+    s.images.getPtr(1).?.drawn = true;
+
+    const src = try testing.allocator.alloc(u8, dim * dim * 4);
+    defer testing.allocator.free(src);
+    @memset(src, 0x11);
+
+    // Build the ring: three frames.
+    for (0..2) |_| {
+        _ = try s.addAnimationFrame(
+            alloc,
+            t.screens.active,
+            1,
+            .{ .composition_mode = .overwrite },
+            src,
+            .rgba,
+            dim,
+            dim,
+            0,
+        );
+    }
+    const anim = s.images.getPtr(1).?.anim.?;
+    anim.state = .running;
+    anim.setGap(0, 16);
+    anim.setGap(1, 16);
+    anim.setGap(2, 16);
+
+    // Warm up.
+    var now: u64 = 0;
+    for (0..8) |i| {
+        _ = try s.addAnimationFrame(
+            alloc,
+            t.screens.active,
+            1,
+            .{ .edit_frame = @intCast((i % 3) + 1), .composition_mode = .overwrite },
+            src,
+            .rgba,
+            dim,
+            dim,
+            0,
+        );
+        now += 16;
+        _ = s.animationTick(now);
+    }
+
+    const bytes = s.total_bytes;
+    const allocs = counting.allocs;
+    const frees = counting.frees;
+
+    // Stream: rewrite each frame in turn and advance, many times over.
+    for (0..300) |i| {
+        _ = try s.addAnimationFrame(
+            alloc,
+            t.screens.active,
+            1,
+            .{ .edit_frame = @intCast((i % 3) + 1), .composition_mode = .overwrite },
+            src,
+            .rgba,
+            dim,
+            dim,
+            0,
+        );
+        now += 16;
+        _ = s.animationTick(now);
+    }
+
+    // Constant memory, and not one allocation: an indefinite stream costs
+    // exactly what its ring costs.
+    try testing.expectEqual(bytes, s.total_bytes);
+    try testing.expectEqual(allocs, counting.allocs);
+    try testing.expectEqual(frees, counting.frees);
+    try testing.expectEqual(@as(usize, 3), anim.frameCount());
+    try expectAccountingExact(&s);
+}
+
+/// Minimal allocation counter for the ring test above.
+const CountingAlloc = struct {
+    parent: Allocator,
+    allocs: usize = 0,
+    frees: usize = 0,
+
+    fn allocator(self: *CountingAlloc) Allocator {
+        return .{ .ptr = self, .vtable = &.{
+            .alloc = a,
+            .resize = r,
+            .remap = m,
+            .free = f,
+        } };
+    }
+    fn a(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const self: *CountingAlloc = @ptrCast(@alignCast(ctx));
+        self.allocs += 1;
+        return self.parent.rawAlloc(len, al, ra);
+    }
+    fn r(ctx: *anyopaque, buf: []u8, al: std.mem.Alignment, n: usize, ra: usize) bool {
+        const self: *CountingAlloc = @ptrCast(@alignCast(ctx));
+        return self.parent.rawResize(buf, al, n, ra);
+    }
+    fn m(ctx: *anyopaque, buf: []u8, al: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const self: *CountingAlloc = @ptrCast(@alignCast(ctx));
+        return self.parent.rawRemap(buf, al, n, ra);
+    }
+    fn f(ctx: *anyopaque, buf: []u8, al: std.mem.Alignment, ra: usize) void {
+        const self: *CountingAlloc = @ptrCast(@alignCast(ctx));
+        self.frees += 1;
+        self.parent.rawFree(buf, al, ra);
+    }
+};
