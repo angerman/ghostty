@@ -673,18 +673,13 @@ fn controlAnimation(
     // "v" is the loop count, off by one: 1 means loop forever.
     if (c.loops > 0) anim.max_loops = c.loops - 1;
 
-    if (visible) {
-        // The pixels on screen changed, so the image needs a new stamp to
-        // make the renderer re-upload its texture.
-        storage.markMutated();
-        img.generation = storage.generation;
-    } else {
-        // Gap, state and loop changes only affect *when* frames are
-        // shown. Marking the storage dirty gets the renderer to recompute
-        // its schedule; bumping the generation would pointlessly re-upload
-        // an unchanged texture on every such command.
-        storage.dirty = true;
-    }
+    // Switching the current frame changes the pixels on screen, so that
+    // image needs a re-upload. Everything else an animation control does
+    // -- gaps, playback state, loop counts -- only affects *when* a frame
+    // is shown, so it costs a reschedule and nothing more. Neither can
+    // move a placement, so neither invalidates layout.
+    if (visible) storage.markPixelsMutated(img, true);
+    storage.markScheduleMutated();
 
     // Kitty sends no response at all for a successful animation control.
     return .{};
@@ -1417,16 +1412,22 @@ test "kittygfx animation control: switching frames" {
     try testing.expect(img.generation != gen_before);
     try testing.expectEqual(@as(u8, 255), img.renderData()[0]);
 
-    // A state-only change reschedules but must not restamp the image.
+    // A state-only change reschedules and nothing more: it must not
+    // restamp the image (that would re-upload an identical texture) and
+    // must not invalidate layout (that would rebuild every placement).
     const gen_running = img.generation;
-    storage.dirty = false;
+    storage.layout_dirty = false;
+    storage.pixel_dirty = false;
+    storage.schedule_dirty = false;
     {
         const cmd = try command.Parser.parseString(alloc, "a=a,i=1,s=3");
         defer cmd.deinit(alloc);
         try testing.expect(execute(alloc, &t, &cmd) == null);
     }
     try testing.expectEqual(gen_running, img.generation);
-    try testing.expect(storage.dirty);
+    try testing.expect(storage.schedule_dirty);
+    try testing.expect(!storage.pixel_dirty);
+    try testing.expect(!storage.layout_dirty);
 }
 
 test "kittygfx animation compose" {

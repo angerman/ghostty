@@ -109,20 +109,34 @@ pub const ImageStorage = struct {
     const ImageMap = std.AutoHashMapUnmanaged(u32, Image);
     const PlacementMap = std.AutoHashMapUnmanaged(PlacementKey, Placement);
 
-    /// Dirty is set to true if placements or images change. This is
-    /// purely informational for the renderer and doesn't affect the
-    /// correctness of the program. The renderer must set this to false
+    /// Layout is dirty: the set of images or placements changed, or the
+    /// geometry they sit at moved. The renderer must rebuild and re-sort
+    /// its placement list. Scrolling, resizing and screen switches set
+    /// this from outside this struct, because they move placement pins
+    /// even though the image set itself is unchanged.
+    ///
+    /// This is purely informational for the renderer and doesn't affect
+    /// the correctness of the program. The renderer must set this to false
     /// if it cares about this value.
     ///
-    /// Note that dirty is also set by scrolling and resizing (outside
-    /// of this struct) because those move placement pins, even though
-    /// the set of images/placements itself is unchanged. See generation
-    /// for a signal that only tracks content mutations.
+    /// Invariant: layout_dirty is always set when the generation changes
+    /// for a layout reason (markLayoutMutated sets both); set without a
+    /// generation change it means a geometry-only event.
+    layout_dirty: bool = false,
+
+    /// Pixels are dirty: some image's currently displayed pixels changed
+    /// while its dimensions stayed the same. The renderer must re-upload
+    /// the affected images' textures, and must NOT rebuild placements --
+    /// nothing about the geometry changed.
     ///
-    /// Invariant: dirty is always set when generation changes
-    /// (markMutated sets both); dirty set without a generation change
-    /// means a geometry-only event.
-    dirty: bool = false,
+    /// This is the animation steady state, so it is deliberately the
+    /// cheapest signal: an advancing frame sets only this.
+    pixel_dirty: bool = false,
+
+    /// The schedule is dirty: animation timing changed (play/stop, a gap,
+    /// a loop count, the current frame). The renderer must recompute when
+    /// its next frame is due, but has no pixel or placement work to do.
+    schedule_dirty: bool = false,
 
     /// Generation stamp of the last content mutation to this storage:
     /// any image transmit/replace, placement add, or delete of either.
@@ -136,7 +150,7 @@ pub const ImageStorage = struct {
     /// observed from any storage never recurs for different content,
     /// even across screen switches or storage resets.
     ///
-    /// This field must only be written via markMutated.
+    /// This field must only be written via markLayoutMutated.
     generation: u64 = 0,
 
     /// This is the next automatically assigned image ID. We start mid-way
@@ -208,16 +222,45 @@ pub const ImageStorage = struct {
     /// the set of images or placements (or image contents).
     ///
     /// Do NOT call this for geometry-only events (scrolling, resizing,
-    /// screen switches); those must set only the dirty flag directly.
+    /// screen switches); those must set only layout_dirty directly.
     /// Bumping the generation for geometry changes would break the
     /// contract that an unchanged generation means unchanged contents.
     ///
-    /// Nor for animation changes that only affect *when* a frame is shown
-    /// (gaps, playback state, loop counts): those set dirty directly so
-    /// the renderer reschedules without re-uploading an identical texture.
-    pub fn markMutated(self: *ImageStorage) void {
-        self.dirty = true;
+    /// Nor for the animation domains: see markPixelsMutated and
+    /// markScheduleMutated, which exist so that an advancing frame does
+    /// not drag a placement rebuild along with it.
+    pub fn markLayoutMutated(self: *ImageStorage) void {
+        self.layout_dirty = true;
         self.generation = nextGeneration();
+    }
+
+    /// Record that a stored image's pixels changed with its dimensions
+    /// unchanged.
+    ///
+    /// `visible` says whether the buffer that changed is the one currently
+    /// on screen. Only then does the renderer have any work to do, and
+    /// only then is the image's own stamp bumped: stamping it otherwise
+    /// would re-upload an identical texture, and a stored-only change (a
+    /// frame that isn't showing) must cost nothing until it is displayed.
+    ///
+    /// This never invalidates layout. An animation advancing a frame, or a
+    /// client editing pixels in place, cannot move a placement.
+    pub fn markPixelsMutated(
+        self: *ImageStorage,
+        img: *Image,
+        visible: bool,
+    ) void {
+        self.generation = nextGeneration();
+        if (!visible) return;
+        img.generation = self.generation;
+        self.pixel_dirty = true;
+    }
+
+    /// Record that animation timing changed. This has no pixel or
+    /// placement consequences: the renderer only needs to work out when it
+    /// is next due.
+    pub fn markScheduleMutated(self: *ImageStorage) void {
+        self.schedule_dirty = true;
     }
 
     /// Sets the limit in bytes for the total amount of image data that
@@ -235,7 +278,7 @@ pub const ImageStorage = struct {
             const image_limits = self.image_limits;
             self.deinit(alloc, s);
             self.* = .{ .image_limits = image_limits };
-            self.markMutated();
+            self.markLayoutMutated();
         }
 
         // If we re lowering our limit, check if we need to evict.
@@ -314,7 +357,7 @@ pub const ImageStorage = struct {
         // every add/replace a unique stamp even when the same image ID
         // is retransmitted with identical dimensions, so consumers
         // (e.g. renderer texture caches) can detect content changes.
-        self.markMutated();
+        self.markLayoutMutated();
         gop.value_ptr.generation = self.generation;
     }
 
@@ -356,7 +399,7 @@ pub const ImageStorage = struct {
         const gop = try self.placements.getOrPut(alloc, key);
         gop.value_ptr.* = p;
 
-        self.markMutated();
+        self.markLayoutMutated();
     }
 
     fn clearPlacements(self: *ImageStorage, s: *terminal.Screen) void {
@@ -501,8 +544,11 @@ pub const ImageStorage = struct {
                 if (!anim.advance()) continue;
 
                 anim.last_frame_ms = now_ms;
-                self.markMutated();
-                img.generation = self.generation;
+
+                // The heart of the fast path: advancing a frame changes
+                // pixels only. It must never invalidate layout, or every
+                // tick would rebuild and re-sort every placement.
+                self.markPixelsMutated(img, true);
                 result.dirtied = true;
 
                 next_at = now_ms +| anim.gapOf(anim.current_frame);
@@ -626,7 +672,7 @@ pub const ImageStorage = struct {
                 if (storage.images.getEntry(c.id)) |entry| {
                     log.info("evicting image id={} bytes={}", .{ c.id, c.bytes });
                     evicted += storage.removeImage(alloc, entry);
-                    storage.markMutated();
+                    storage.markLayoutMutated();
                 }
 
                 if (evicted >= self.required) break;
@@ -876,17 +922,17 @@ pub const ImageStorage = struct {
             anim.setGap(frame - 1, animation.resolveGap(params.gap));
         }
 
-        // The frame set or its pixels changed either way, but only stamp
-        // the image (and so force a texture re-upload) when what's on
-        // screen actually changed.
-        self.markMutated();
+        // Frame pixels changed, never geometry: an added or edited frame
+        // has the image's dimensions, so this must not invalidate layout.
+        // Only a change to the frame on screen costs the renderer an
+        // upload; a stored-only change costs nothing until it displays.
         const visible = !is_new and frame - 1 == anim.current_frame;
+        self.markPixelsMutated(img, visible);
         if (visible) {
-            img.generation = self.generation;
-
             // Editing the visible frame restarts its gap interval, so it
             // stays up for the full new gap rather than a leftover slice.
             anim.last_frame_ms = now_ms;
+            self.markScheduleMutated();
         }
 
         return .{ .frame = frame, .visible = visible };
@@ -1022,8 +1068,6 @@ pub const ImageStorage = struct {
             img.anim.?.frames.items[dst_frame - 2].data = target;
         }
 
-        self.markMutated();
-
         // Note that an image with no animation state at all can only be
         // composing its root onto itself, which is always what's on
         // screen. There's nothing to play, so no state is created for it.
@@ -1031,9 +1075,12 @@ pub const ImageStorage = struct {
             dst_frame - 1 == anim.current_frame
         else
             true;
+        self.markPixelsMutated(img, visible);
         if (visible) {
-            img.generation = self.generation;
-            if (img.anim) |anim| anim.last_frame_ms = now_ms;
+            if (img.anim) |anim| {
+                anim.last_frame_ms = now_ms;
+                self.markScheduleMutated();
+            }
         }
 
         return visible;
@@ -1086,7 +1133,7 @@ pub const ImageStorage = struct {
         if (frame_count == 1) {
             if (!v.delete) return .no_op_or_missing;
             self.deleteById(alloc, t.screens.active, image_id, 0, true);
-            self.markMutated();
+            self.markLayoutMutated();
             return .changed;
         }
 
@@ -1128,13 +1175,13 @@ pub const ImageStorage = struct {
             anim.current_frame -= 1;
         }
 
-        // The stored frames changed either way, but only stamp the image
-        // when what's actually on screen changed.
-        self.markMutated();
-        if (before != @intFromPtr(img.renderData().ptr)) {
-            img.generation = self.generation;
-            anim.last_frame_ms = now_ms;
-        }
+        // The stored frames changed either way, but dimensions cannot
+        // have, so this is the pixel domain. Only stamp the image when
+        // what is actually on screen changed.
+        const changed = before != @intFromPtr(img.renderData().ptr);
+        self.markPixelsMutated(img, changed);
+        if (changed) anim.last_frame_ms = now_ms;
+        self.markScheduleMutated();
 
         return .changed;
     }
@@ -1155,7 +1202,7 @@ pub const ImageStorage = struct {
         const placements_before = self.placements.count();
         const images_before = self.images.count();
         defer if (self.placements.count() != placements_before or
-            self.images.count() != images_before) self.markMutated();
+            self.images.count() != images_before) self.markLayoutMutated();
 
         switch (cmd) {
             .all => |delete_images| {
@@ -1493,7 +1540,7 @@ pub const ImageStorage = struct {
         // Evicting anything is a content mutation. This matters for the
         // setLimit path in particular, which doesn't otherwise mark it.
         var any_evicted = false;
-        defer if (any_evicted) self.markMutated();
+        defer if (any_evicted) self.markLayoutMutated();
 
         // They're in order of best to evict.
         var evicted: usize = 0;
@@ -1854,9 +1901,9 @@ test "storage: delete all placements and images" {
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
 
-    s.dirty = false;
+    s.layout_dirty = false;
     s.delete(alloc, &t, .{ .all = true });
-    try testing.expect(s.dirty);
+    try testing.expect(s.layout_dirty);
     try testing.expectEqual(@as(usize, 0), s.images.count());
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
@@ -1878,9 +1925,9 @@ test "storage: delete all placements and images preserves limit" {
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
 
-    s.dirty = false;
+    s.layout_dirty = false;
     s.delete(alloc, &t, .{ .all = true });
-    try testing.expect(s.dirty);
+    try testing.expect(s.layout_dirty);
     try testing.expectEqual(@as(usize, 0), s.images.count());
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(@as(usize, 5000), s.total_limit);
@@ -1902,9 +1949,9 @@ test "storage: delete all placements" {
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
 
-    s.dirty = false;
+    s.layout_dirty = false;
     s.delete(alloc, &t, .{ .all = false });
-    try testing.expect(s.dirty);
+    try testing.expect(s.layout_dirty);
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
@@ -1925,9 +1972,9 @@ test "storage: delete all placements by image id" {
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
 
-    s.dirty = false;
+    s.layout_dirty = false;
     s.delete(alloc, &t, .{ .id = .{ .image_id = 2 } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.layout_dirty);
     try testing.expectEqual(@as(usize, 1), s.placements.count());
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
@@ -1948,9 +1995,9 @@ test "storage: delete all placements by image id and unused images" {
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
 
-    s.dirty = false;
+    s.layout_dirty = false;
     s.delete(alloc, &t, .{ .id = .{ .delete = true, .image_id = 2 } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.layout_dirty);
     try testing.expectEqual(@as(usize, 1), s.placements.count());
     try testing.expectEqual(@as(usize, 2), s.images.count());
     try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
@@ -1972,13 +2019,13 @@ test "storage: delete placement by specific id" {
     try s.addPlacement(alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     try s.addPlacement(alloc, 2, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
 
-    s.dirty = false;
+    s.layout_dirty = false;
     s.delete(alloc, &t, .{ .id = .{
         .delete = true,
         .image_id = 1,
         .placement_id = 2,
     } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.layout_dirty);
     try testing.expectEqual(@as(usize, 2), s.placements.count());
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(tracked + 2, t.screens.active.pages.countTrackedPins());
@@ -2002,9 +2049,9 @@ test "storage: delete intersecting cursor" {
 
     t.screens.active.cursorAbsolute(12, 12);
 
-    s.dirty = false;
+    s.layout_dirty = false;
     s.delete(alloc, &t, .{ .intersect_cursor = false });
-    try testing.expect(s.dirty);
+    try testing.expect(s.layout_dirty);
     try testing.expectEqual(@as(usize, 1), s.placements.count());
     try testing.expectEqual(@as(usize, 2), s.images.count());
     try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
@@ -2034,9 +2081,9 @@ test "storage: delete intersecting cursor plus unused" {
 
     t.screens.active.cursorAbsolute(12, 12);
 
-    s.dirty = false;
+    s.layout_dirty = false;
     s.delete(alloc, &t, .{ .intersect_cursor = true });
-    try testing.expect(s.dirty);
+    try testing.expect(s.layout_dirty);
     try testing.expectEqual(@as(usize, 1), s.placements.count());
     try testing.expectEqual(@as(usize, 2), s.images.count());
     try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
@@ -2066,9 +2113,9 @@ test "storage: delete intersecting cursor hits multiple" {
 
     t.screens.active.cursorAbsolute(26, 26);
 
-    s.dirty = false;
+    s.layout_dirty = false;
     s.delete(alloc, &t, .{ .intersect_cursor = true });
-    try testing.expect(s.dirty);
+    try testing.expect(s.layout_dirty);
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(@as(usize, 1), s.images.count());
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
@@ -2090,12 +2137,12 @@ test "storage: delete by column" {
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
     try s.addPlacement(alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
 
-    s.dirty = false;
+    s.layout_dirty = false;
     s.delete(alloc, &t, .{ .column = .{
         .delete = false,
         .x = 60,
     } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.layout_dirty);
     try testing.expectEqual(@as(usize, 1), s.placements.count());
     try testing.expectEqual(@as(usize, 2), s.images.count());
     try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
@@ -2156,12 +2203,12 @@ test "storage: delete by row" {
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = 0 }) } });
     try s.addPlacement(alloc, 1, 2, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 25, .y = 25 }) } });
 
-    s.dirty = false;
+    s.layout_dirty = false;
     s.delete(alloc, &t, .{ .row = .{
         .delete = false,
         .y = 60,
     } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.layout_dirty);
     try testing.expectEqual(@as(usize, 1), s.placements.count());
     try testing.expectEqual(@as(usize, 2), s.images.count());
     try testing.expectEqual(tracked + 1, t.screens.active.pages.countTrackedPins());
@@ -2223,9 +2270,9 @@ test "storage: delete images by range 1" {
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(@as(usize, 2), s.placements.count());
 
-    s.dirty = false;
+    s.layout_dirty = false;
     s.delete(alloc, &t, .{ .range = .{ .delete = false, .first = 1, .last = 2 } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.layout_dirty);
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
@@ -2248,9 +2295,9 @@ test "storage: delete images by range 2" {
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(@as(usize, 2), s.placements.count());
 
-    s.dirty = false;
+    s.layout_dirty = false;
     s.delete(alloc, &t, .{ .range = .{ .delete = true, .first = 1, .last = 2 } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.layout_dirty);
     try testing.expectEqual(@as(usize, 1), s.images.count());
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
@@ -2273,9 +2320,9 @@ test "storage: delete images by range 3" {
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(@as(usize, 2), s.placements.count());
 
-    s.dirty = false;
+    s.layout_dirty = false;
     s.delete(alloc, &t, .{ .range = .{ .delete = false, .first = 1, .last = 1 } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.layout_dirty);
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
@@ -2298,9 +2345,9 @@ test "storage: delete images by range 4" {
     try testing.expectEqual(@as(usize, 3), s.images.count());
     try testing.expectEqual(@as(usize, 2), s.placements.count());
 
-    s.dirty = false;
+    s.layout_dirty = false;
     s.delete(alloc, &t, .{ .range = .{ .delete = true, .first = 1, .last = 1 } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.layout_dirty);
     try testing.expectEqual(@as(usize, 1), s.images.count());
     try testing.expectEqual(@as(usize, 0), s.placements.count());
     try testing.expectEqual(tracked, t.screens.active.pages.countTrackedPins());
@@ -2427,17 +2474,17 @@ test "storage: generation bumps when setLimit evicts or disables" {
     const gen_add = s.generation;
 
     // Lowering the limit evicts the image and must mark a mutation.
-    s.dirty = false;
+    s.layout_dirty = false;
     try s.setLimit(alloc, t.screens.active, 1);
-    try testing.expect(s.dirty);
+    try testing.expect(s.layout_dirty);
     try testing.expect(s.generation > gen_add);
     try testing.expectEqual(@as(usize, 0), s.images.count());
     const gen_evict = s.generation;
 
     // Disabling (limit=0) resets the storage and must mark a mutation.
-    s.dirty = false;
+    s.layout_dirty = false;
     try s.setLimit(alloc, t.screens.active, 0);
-    try testing.expect(s.dirty);
+    try testing.expect(s.layout_dirty);
     try testing.expect(s.generation > gen_evict);
 }
 
@@ -2481,21 +2528,21 @@ test "storage: no-op delete does not mark a mutation" {
     // A delete-all on an empty storage (this runs on every screen
     // clear) must not dirty the state or bump the generation.
     s.delete(alloc, &t, .{ .all = true });
-    try testing.expect(!s.dirty);
+    try testing.expect(!s.layout_dirty);
     try testing.expectEqual(@as(u64, 0), s.generation);
 
     // Same for a delete that matches nothing.
     try s.addImage(alloc, t.screens.active, .{ .id = 1 });
     try s.addPlacement(alloc, 1, 1, .{ .location = .{ .pin = try trackPin(&t, .{ .x = 1, .y = 1 }) } });
     const gen = s.generation;
-    s.dirty = false;
+    s.layout_dirty = false;
     s.delete(alloc, &t, .{ .id = .{ .image_id = 42 } });
-    try testing.expect(!s.dirty);
+    try testing.expect(!s.layout_dirty);
     try testing.expectEqual(gen, s.generation);
 
     // But a delete that removes something does mark a mutation.
     s.delete(alloc, &t, .{ .id = .{ .image_id = 1 } });
-    try testing.expect(s.dirty);
+    try testing.expect(s.layout_dirty);
     try testing.expect(s.generation > gen);
 }
 

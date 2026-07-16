@@ -33,6 +33,19 @@ pub const State = struct {
     /// on frame builds and are generally more expensive to handle.
     kitty_virtual: bool,
 
+    /// The Kitty images that the current layout actually draws.
+    ///
+    /// Retained from the last layout synchronization so that a pixel-only
+    /// update -- an animation frame advancing, or a client editing pixels
+    /// in place -- visits each changed image exactly once without
+    /// rebuilding or re-sorting a single placement, however many
+    /// placements reference it. It is an ordered set so that iteration is
+    /// deterministic and deduplication is O(1) per placement.
+    ///
+    /// This is also what "visible" means for animation scheduling: an
+    /// image present in terminal storage but not drawn is not here.
+    kitty_visible: std.AutoArrayHashMapUnmanaged(u32, void),
+
     /// Overlays
     overlay_placements: std.ArrayListUnmanaged(Placement),
 
@@ -42,6 +55,7 @@ pub const State = struct {
         .kitty_bg_end = 0,
         .kitty_text_end = 0,
         .kitty_virtual = false,
+        .kitty_visible = .empty,
         .overlay_placements = .empty,
     };
 
@@ -52,6 +66,7 @@ pub const State = struct {
             self.images.deinit(alloc);
         }
         self.kitty_placements.deinit(alloc);
+        self.kitty_visible.deinit(alloc);
         self.overlay_placements.deinit(alloc);
     }
 
@@ -233,12 +248,14 @@ pub const State = struct {
     /// on the terminal state and our internal state.
     ///
     /// This does not read/write state used by drawing.
-    pub fn kittyRequiresUpdate(
+    /// Whether the placement list has to be rebuilt: the set of images or
+    /// placements changed, or the geometry they sit at moved.
+    pub fn kittyRequiresLayoutUpdate(
         self: *const State,
         t: *const terminal.Terminal,
     ) bool {
         // If the terminal kitty image state is dirty, we must update.
-        if (t.screens.active.kitty_images.dirty) return true;
+        if (t.screens.active.kitty_images.layout_dirty) return true;
 
         // If we have any virtual references, we must also rebuild our
         // kitty state on every frame because any cell change can move
@@ -249,21 +266,41 @@ pub const State = struct {
         return false;
     }
 
-    /// Update the Kitty graphics state from the terminal.
+    /// Whether some drawn image's pixels changed while its dimensions
+    /// stayed the same. This is the animation steady state, and it must
+    /// stay strictly cheaper than a layout update.
+    pub fn kittyRequiresPixelUpdate(
+        _: *const State,
+        t: *const terminal.Terminal,
+    ) bool {
+        return t.screens.active.kitty_images.pixel_dirty;
+    }
+
+    /// Rebuild the placement list and synchronize every drawn image.
+    ///
+    /// This is the expensive path: it clears and rebuilds every placement,
+    /// sorts them by z, and probes viewport geometry. Only layout changes
+    /// may come here. An animation tick must use kittyUpdatePixels, or
+    /// every frame would pay for all of this to produce the same list.
     ///
     /// This reads/writes state used by drawing.
-    pub fn kittyUpdate(
+    pub fn kittyUpdatePlacements(
         self: *State,
         alloc: Allocator,
         t: *const terminal.Terminal,
         cell_size: CellSize,
     ) void {
         const storage = &t.screens.active.kitty_images;
-        defer storage.dirty = false;
+        defer storage.layout_dirty = false;
+
+        // A rebuild synchronizes every drawn image's pixels on the way
+        // through, so it satisfies any outstanding pixel invalidation too.
+        defer storage.pixel_dirty = false;
 
         // We always clear our previous placements no matter what because
         // we rebuild them from scratch.
         self.kitty_placements.clearRetainingCapacity();
+        self.kitty_visible.clearRetainingCapacity();
         self.kitty_virtual = false;
 
         // Go through our known images and if there are any that are no longer
@@ -389,6 +426,33 @@ pub const State = struct {
         // Same idea for the image_text_end.
         self.kitty_text_end =
             text_end orelse @intCast(self.kitty_placements.items.len);
+    }
+
+    /// Re-upload the pixels of drawn images whose content changed, without
+    /// touching placements.
+    ///
+    /// This is the animation steady state. It visits each drawn image once
+    /// -- not once per placement -- and prepImage's generation check makes
+    /// the images that did not change free, so an advancing frame costs one
+    /// image's upload and nothing else.
+    pub fn kittyUpdatePixels(
+        self: *State,
+        alloc: Allocator,
+        t: *const terminal.Terminal,
+    ) void {
+        const storage = &t.screens.active.kitty_images;
+        defer storage.pixel_dirty = false;
+
+        for (self.kitty_visible.keys()) |id| {
+            const img = storage.imageById(id) orelse continue;
+            self.prepKittyImage(alloc, &img) catch |err| {
+                // Leave pixel_dirty set for a retry rather than losing the
+                // change: the deferred clear above is the only reason this
+                // needs saying, so undo it.
+                storage.pixel_dirty = true;
+                log.warn("error preparing kitty image id={} err={}", .{ id, err });
+            };
+        }
     }
 
     const PrepImageError = error{
@@ -596,6 +660,11 @@ pub const State = struct {
         alloc: Allocator,
         image: *const terminal.kitty.graphics.Image,
     ) PrepImageError!void {
+        // Record that this image is actually drawn. Pixel-only updates and
+        // animation scheduling both work from this set rather than from
+        // everything terminal storage happens to hold.
+        try self.kitty_visible.put(alloc, image.id, {});
+
         // An animated image renders its current frame rather than its own
         // data. Every frame has the image's dimensions, so nothing else
         // about the placement changes. The image's generation is bumped
@@ -969,3 +1038,78 @@ pub const Image = union(enum) {
         };
     }
 };
+
+test "kitty: a frame advance does not rebuild placements" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+    t.width_px = 100;
+    t.height_px = 100;
+
+    const storage = &t.screens.active.kitty_images;
+
+    // A 2x2 RGBA image with a frame, placed and playing.
+    const data = try alloc.alloc(u8, 2 * 2 * 4);
+    @memset(data, 1);
+    {
+        // Scoped so the errdefer covers only the handoff: addImage takes
+        // ownership on success and storage frees it from then on.
+        errdefer alloc.free(data);
+        try storage.addImage(alloc, t.screens.active, .{
+            .id = 1,
+            .width = 2,
+            .height = 2,
+            .format = .rgba,
+            .data = data,
+        });
+    }
+    const pin = try t.screens.active.pages.trackPin(
+        t.screens.active.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
+    );
+    try storage.addPlacement(alloc, 1, 0, .{ .location = .{ .pin = pin } });
+
+    const src: [2 * 2 * 4]u8 = @splat(9);
+    _ = try storage.addAnimationFrame(alloc, t.screens.active, 1, .{}, &src, .rgba, 2, 2, 0);
+    const anim = storage.images.getPtr(1).?.anim.?;
+    anim.state = .running;
+    anim.setGap(0, 100);
+    anim.setGap(1, 100);
+
+    var state: State = .empty;
+    defer state.deinit(alloc);
+    const cell_size: CellSize = .{ .width = 10, .height = 10 };
+
+    // One layout synchronization to warm up.
+    try testing.expect(state.kittyRequiresLayoutUpdate(&t));
+    state.kittyUpdatePlacements(alloc, &t, cell_size);
+    try testing.expectEqual(@as(usize, 1), state.kitty_placements.items.len);
+    try testing.expectEqual(@as(usize, 1), state.kitty_visible.count());
+    try testing.expect(!state.kittyRequiresLayoutUpdate(&t));
+    try testing.expect(!state.kittyRequiresPixelUpdate(&t));
+
+    // Now advance a frame. This is the animation steady state: it must
+    // ask for a pixel update and must NOT ask for a layout rebuild.
+    const r = storage.animationTick(100);
+    try testing.expect(r.dirtied);
+    try testing.expect(!state.kittyRequiresLayoutUpdate(&t));
+    try testing.expect(state.kittyRequiresPixelUpdate(&t));
+
+    // The pixel update leaves the placement list untouched, and the
+    // renderer's copy of the image follows the new frame.
+    const placements_ptr = state.kitty_placements.items.ptr;
+    state.kittyUpdatePixels(alloc, &t);
+    try testing.expectEqual(@as(usize, 1), state.kitty_placements.items.len);
+    try testing.expectEqual(placements_ptr, state.kitty_placements.items.ptr);
+    try testing.expect(!state.kittyRequiresPixelUpdate(&t));
+
+    const prepped = state.images.get(.{ .kitty = 1 }).?;
+    try testing.expectEqual(storage.images.getPtr(1).?.generation, prepped.generation);
+
+    // A schedule-only change is neither: it must not touch pixels or
+    // placements at all.
+    storage.markScheduleMutated();
+    try testing.expect(!state.kittyRequiresLayoutUpdate(&t));
+    try testing.expect(!state.kittyRequiresPixelUpdate(&t));
+}

@@ -1254,12 +1254,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // If we have any virtual references, we must also rebuild our
                 // kitty state on every frame because any cell change can move
                 // an image.
-                if (self.images.kittyRequiresUpdate(state.terminal)) {
+                if (self.images.kittyRequiresLayoutUpdate(state.terminal)) {
                     // We need to grab the draw mutex since this updates
                     // our image state that drawFrame uses.
                     self.draw_mutex.lock();
                     defer self.draw_mutex.unlock();
-                    self.images.kittyUpdate(
+                    self.images.kittyUpdatePlacements(
                         self.alloc,
                         state.terminal,
                         .{
@@ -1267,6 +1267,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             .height = self.grid_metrics.cell_height,
                         },
                     );
+                } else if (self.images.kittyRequiresPixelUpdate(state.terminal)) {
+                    // An animation frame advanced, or a client edited
+                    // pixels in place. The placements are unchanged, so
+                    // only the changed images' textures are re-uploaded:
+                    // this is the path a playing animation takes every
+                    // frame and it must stay off the SLOW path above.
+                    self.draw_mutex.lock();
+                    defer self.draw_mutex.unlock();
+                    self.images.kittyUpdatePixels(self.alloc, state.terminal);
                 }
 
                 // Work out when the next Kitty animation frame is due, so

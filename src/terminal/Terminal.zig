@@ -2023,7 +2023,7 @@ pub fn index(self: *Terminal) !void {
     {
         if (comptime build_options.kitty_graphics) {
             // Scrolling dirties the images because it updates their placements pins.
-            screen.kitty_images.dirty = true;
+            screen.kitty_images.layout_dirty = true;
         }
 
         // If our scrolling region is at the top, we create scrollback,
@@ -2230,7 +2230,7 @@ pub fn scrollUp(self: *Terminal, count: usize) !void {
     {
         // Scrolling dirties the images because it updates their placements pins.
         if (comptime build_options.kitty_graphics) {
-            self.screens.active.kitty_images.dirty = true;
+            self.screens.active.kitty_images.layout_dirty = true;
         }
 
         // Clamp count to the scroll region height.
@@ -2479,7 +2479,7 @@ pub fn insertLines(self: *Terminal, count: usize) void {
 
     if (comptime build_options.kitty_graphics) {
         // Scrolling dirties the images because it updates their placements pins.
-        self.screens.active.kitty_images.dirty = true;
+        self.screens.active.kitty_images.layout_dirty = true;
     }
 
     // At the end we need to return the cursor to the row it started on.
@@ -2686,7 +2686,7 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
 
     if (comptime build_options.kitty_graphics) {
         // Scrolling dirties the images because it updates their placements pins.
-        self.screens.active.kitty_images.dirty = true;
+        self.screens.active.kitty_images.layout_dirty = true;
     }
 
     // At the end we need to return the cursor to the row it started on.
@@ -3751,7 +3751,7 @@ pub fn switchScreen(self: *Terminal, key: ScreenSet.Key) !?*Screen {
         // Mark kitty images as dirty so they redraw. Without this set
         // the images will remain where they were (the dirty bit on
         // the screen only tracks the terminal grid, not the images).
-        new.kitty_images.dirty = true;
+        new.kitty_images.layout_dirty = true;
     }
 
     // Mark our terminal as dirty to redraw the grid.

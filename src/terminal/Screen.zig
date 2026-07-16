@@ -396,7 +396,7 @@ pub fn reset(self: *Screen) void {
     if (comptime build_options.kitty_graphics) {
         // Reset kitty graphics storage
         self.kitty_images.deinit(self.alloc, self);
-        self.kitty_images = .{ .dirty = true };
+        self.kitty_images = .{ .layout_dirty = true };
     }
 
     // Reset our basic state
@@ -809,7 +809,7 @@ pub fn cursorDownScroll(self: *Screen) !void {
 
     if (comptime build_options.kitty_graphics) {
         // Scrolling dirties the images because it updates their placements pins.
-        self.kitty_images.dirty = true;
+        self.kitty_images.layout_dirty = true;
     }
 
     // If we have no scrollback, then we shift all our rows instead.
@@ -1470,7 +1470,7 @@ pub inline fn scroll(self: *Screen, behavior: Scroll) void {
         // No matter what, scrolling marks our image state as dirty since
         // it could move placements. If there are no placements or no images
         // this is still a very cheap operation.
-        self.kitty_images.dirty = true;
+        self.kitty_images.layout_dirty = true;
     }
 
     switch (behavior) {
@@ -1495,7 +1495,7 @@ pub inline fn scrollClear(self: *Screen) !void {
         // No matter what, scrolling marks our image state as dirty since
         // it could move placements. If there are no placements or no images
         // this is still a very cheap operation.
-        self.kitty_images.dirty = true;
+        self.kitty_images.layout_dirty = true;
     }
 }
 
@@ -1868,7 +1868,7 @@ pub inline fn resize(
 
     if (comptime build_options.kitty_graphics) {
         // No matter what we mark our image state as dirty
-        self.kitty_images.dirty = true;
+        self.kitty_images.layout_dirty = true;
     }
 
     // Release the cursor style while resizing just
