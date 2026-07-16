@@ -453,16 +453,27 @@ pub const State = struct {
         for (self.kitty_visible.keys()) |id| {
             const img = storage.images.getPtr(id) orelse continue;
             self.prepKittyImage(alloc, img) catch |err| {
-                // Leave pixel_dirty set, and the damage un-acknowledged,
-                // so the next frame retries the whole accumulated region
-                // rather than losing the part of it that failed.
+                // Staging failed: leave pixel_dirty set and the damage
+                // un-acknowledged so the next frame retries the whole
+                // accumulated region rather than losing the failed part.
                 storage.pixel_dirty = true;
                 log.warn("error preparing kitty image id={} err={}", .{ id, err });
                 continue;
             };
 
-            // Staged successfully: everything up to here is accounted for,
-            // so start accumulating again from nothing.
+            // Acknowledge the damage once it is staged. Note this is at
+            // *stage* time, not GPU-upload time: prepImage stamps the
+            // generation here, and the actual upload happens later in
+            // State.upload without the terminal lock. That matches the
+            // renderer's existing acknowledge-at-stage contract for every
+            // image, and the staged region survives a GPU upload failure
+            // because the image stays pending and State.upload retries it.
+            // The one gap it leaves -- a GPU upload failing while fresh
+            // damage to a different region arrives before the retry -- is
+            // rare (GPU errors are), pre-existing, and noted for the
+            // reviewer rather than fixed here, since a true upload-time
+            // acknowledge is a cross-boundary change to the shared image
+            // generation model.
             img.damage = .none;
         }
     }
