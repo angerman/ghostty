@@ -973,6 +973,41 @@ pub const Image = union(enum) {
         // Get our pending info
         const p = self.getPending().?;
 
+        // If we're replacing an image whose shape is unchanged, upload
+        // into the texture we already have rather than building a new one
+        // and throwing the old one away. That is the animation steady
+        // state: a playing animation would otherwise create and destroy a
+        // texture on every single frame.
+        //
+        // Everything is converted to RGBA above and every texture is made
+        // with the same options, so matching dimensions is enough to know
+        // the existing texture can hold these pixels.
+        if (self.getTexture()) |existing| {
+            if (textureFits(existing.width, existing.height, p)) {
+                existing.replaceRegion(
+                    0,
+                    0,
+                    p.width,
+                    p.height,
+                    p.dataSlice(),
+                ) catch |err| {
+                    // Keep the old texture and the pending bytes so the
+                    // next frame retries. Never leave a valid frame
+                    // replaced by blank or half-written texture state.
+                    log.warn("error replacing texture region err={}", .{err});
+                    return error.UploadFailed;
+                };
+                errdefer comptime unreachable;
+
+                // The pixels are in the texture we already had, so only
+                // the pending copy is released. The texture identity, and
+                // anything the GPU holds referencing it, is preserved.
+                alloc.free(p.dataSlice());
+                self.* = .{ .ready = existing };
+                return;
+            }
+        }
+
         // Create our texture
         const texture = Texture.init(
             api.imageTextureOptions(.rgba, true),
@@ -984,11 +1019,23 @@ pub const Image = union(enum) {
 
         // Uploaded. We can now clear our data and change our state.
         //
-        // NOTE: For the `replace` state, this will free the old texture.
-        //       We don't currently actually replace the existing texture
-        //       in-place but that is an optimization we can do later.
+        // NOTE: For the `replace` state, this frees the old texture. We
+        //       only get here when the shape genuinely changed, so the old
+        //       texture cannot hold the new pixels.
         self.deinit(alloc);
         self.* = .{ .ready = texture };
+    }
+
+    /// Whether pixels of the pending shape can be uploaded into an
+    /// existing texture of the given shape rather than requiring a new
+    /// texture to be created.
+    ///
+    /// Everything is converted to RGBA before upload and every image
+    /// texture is created with the same options, so matching dimensions is
+    /// the whole condition. Split out from upload so the rule can be
+    /// tested without a GPU.
+    fn textureFits(tex_width: usize, tex_height: usize, p: Pending) bool {
+        return tex_width == p.width and tex_height == p.height;
     }
 
     /// Returns any pending image data for this image that requires upload.
@@ -1112,4 +1159,24 @@ test "kitty: a frame advance does not rebuild placements" {
     storage.markScheduleMutated();
     try testing.expect(!state.kittyRequiresLayoutUpdate(&t));
     try testing.expect(!state.kittyRequiresPixelUpdate(&t));
+}
+
+test "kitty: an unchanged shape reuses the texture" {
+    const testing = std.testing;
+
+    // A dimension-stable animation must reuse its texture: recreating one
+    // per frame is exactly what this path exists to avoid.
+    var bytes: [4]u8 = @splat(0);
+    const p: Image.Pending = .{
+        .width = 64,
+        .height = 32,
+        .pixel_format = .rgba,
+        .data = &bytes,
+    };
+    try testing.expect(Image.textureFits(64, 32, p));
+
+    // A genuine shape change cannot go into the existing texture.
+    try testing.expect(!Image.textureFits(64, 33, p));
+    try testing.expect(!Image.textureFits(65, 32, p));
+    try testing.expect(!Image.textureFits(0, 0, p));
 }
