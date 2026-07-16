@@ -57,6 +57,11 @@ pub const Options = struct {
     /// percent. 100 is a full frame; 10 approximates a VNC-sized update.
     damage_percent: u32 = 100,
 
+    /// Compose with overwrite rather than alpha blending. A client
+    /// sending opaque frames (video, most VNC) can ask for this with
+    /// C=1, and RGB/gray input takes it automatically.
+    overwrite: bool = false,
+
     /// How many operations one benchmark step performs.
     ///
     /// The harness runs a step once and hyperfine times the process, so a
@@ -318,7 +323,10 @@ fn stepIngestEdit(ptr: *anyopaque) Benchmark.Error!void {
             self.alloc,
             term.screens.active,
             1,
-            .{ .edit_frame = 1 },
+            .{
+                .edit_frame = 1,
+                .composition_mode = if (self.opts.overwrite) .overwrite else .alpha_blend,
+            },
             self.src,
             .rgba,
             dw,
