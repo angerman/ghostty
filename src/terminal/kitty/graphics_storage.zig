@@ -4326,3 +4326,45 @@ test "storage: multiple simultaneous animations advance independently" {
     s.images.getPtr(1).?.anim.?.state = .stopped;
     try testing.expect(s.nextAnimationDeadline() != null);
 }
+
+test "storage: scrolling after eviction does not dereference stale pins" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 5, .cols = 10 });
+    defer t.deinit(alloc);
+    const baseline = t.screens.active.pages.countTrackedPins();
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    // Place several images, each with a pin in the viewport, then evict
+    // them. If eviction left any pin registered in the PageList, the
+    // scrolling below would dereference freed pin memory and the testing
+    // allocator would catch the use-after-free.
+    for (0..4) |i| {
+        try testAddImage(&s, alloc, t.screens.active, @intCast(i + 1), 2, 2, .rgba, @intCast(i));
+        try s.addPlacement(alloc, @intCast(i + 1), 0, .{
+            .location = .{ .pin = try trackPin(&t, .{ .x = 0, .y = @intCast(i % 5) }) },
+        });
+    }
+    // Force eviction of everything by dropping the limit to zero-ish.
+    try s.setLimit(alloc, t.screens.active, 8);
+    try testing.expect(s.images.count() < 4);
+
+    // Now churn the pages hard: write and scroll far more than the
+    // scrollback, which trims and compacts pages -- exactly what would
+    // trip over a dangling tracked pin.
+    for (0..200) |i| {
+        try t.printString("line");
+        try t.index();
+        t.carriageReturn();
+        _ = i;
+    }
+    t.scrollViewport(.top);
+    t.scrollViewport(.bottom);
+
+    // No crash, and every evicted image's pin was released: the only pins
+    // left are the terminal's own baseline.
+    try testing.expectEqual(baseline, t.screens.active.pages.countTrackedPins());
+    try expectAccountingExact(&s);
+}
