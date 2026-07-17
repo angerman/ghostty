@@ -4250,3 +4250,79 @@ const CountingAlloc = struct {
         self.parent.rawFree(buf, al, ra);
     }
 };
+
+test "storage: animation is per-screen, frozen while the alt screen is active" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+
+    // A playing, drawn animation on the primary screen.
+    const prim = &t.screens.active.kitty_images;
+    try testAddPlayableImage(prim, alloc, &t, 1, 1);
+    const anim = prim.images.getPtr(1).?.anim.?;
+
+    // It advances on the primary while primary is active.
+    try testing.expect(prim.animationTick(100).dirtied);
+    try testing.expectEqual(@as(u32, 1), anim.current_frame);
+    try testing.expect(prim.nextAnimationDeadline() != null);
+
+    // Switch to the alternate screen. Its storage is a different, empty
+    // one, so the renderer (which only ticks the active screen) never
+    // touches the primary animation while the alt screen is up.
+    try t.switchScreenMode(.@"1049", true);
+    const alt = &t.screens.active.kitty_images;
+    try testing.expect(alt != prim);
+    try testing.expectEqual(@as(?u64, null), alt.nextAnimationDeadline());
+    try testing.expect(!alt.animationTick(10_000).dirtied);
+
+    // The primary animation is frozen: ticking the active (alt) screen a
+    // long time later left the primary's frame and timestamp untouched.
+    try testing.expectEqual(@as(u32, 1), anim.current_frame);
+    try testing.expectEqual(@as(u64, 100), anim.last_frame_ms);
+
+    // Switching back makes the primary active and schedulable again, with
+    // no catch-up: it resumes from where it was.
+    try t.switchScreenMode(.@"1049", false);
+    const back = &t.screens.active.kitty_images;
+    try testing.expect(back.nextAnimationDeadline() != null);
+    try testing.expectEqual(@as(u32, 1), back.images.getPtr(1).?.anim.?.current_frame);
+    try testing.expect(back.animationTick(10_000).dirtied);
+    try testing.expectEqual(@as(u32, 0), back.images.getPtr(1).?.anim.?.current_frame);
+}
+
+test "storage: multiple simultaneous animations advance independently" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t = try terminal.Terminal.init(alloc, .{ .rows = 10, .cols = 10 });
+    defer t.deinit(alloc);
+
+    var s: ImageStorage = .{};
+    defer s.deinit(alloc, t.screens.active);
+
+    // Three animations with different gaps, all drawn and running.
+    try testAddPlayableImage(&s, alloc, &t, 1, 1);
+    try testAddPlayableImage(&s, alloc, &t, 2, 1);
+    try testAddPlayableImage(&s, alloc, &t, 3, 1);
+    s.images.getPtr(1).?.anim.?.setGap(0, 100);
+    s.images.getPtr(2).?.anim.?.setGap(0, 200);
+    s.images.getPtr(3).?.anim.?.setGap(0, 300);
+
+    // At t=100 only image 1 is due; the deadline is the earliest of all.
+    try testing.expectEqual(@as(?u64, 100), s.nextAnimationDeadline());
+    const r = s.animationTick(100);
+    try testing.expect(r.dirtied);
+    try testing.expectEqual(@as(u32, 1), s.images.getPtr(1).?.anim.?.current_frame);
+    try testing.expectEqual(@as(u32, 0), s.images.getPtr(2).?.anim.?.current_frame);
+    try testing.expectEqual(@as(u32, 0), s.images.getPtr(3).?.anim.?.current_frame);
+
+    // Next due is image 2 at 200.
+    try testing.expectEqual(@as(?u64, 200), s.nextAnimationDeadline());
+    _ = s.animationTick(200);
+    try testing.expectEqual(@as(u32, 1), s.images.getPtr(2).?.anim.?.current_frame);
+    try testing.expectEqual(@as(u32, 0), s.images.getPtr(3).?.anim.?.current_frame);
+
+    // Stopping one leaves the others scheduled.
+    s.images.getPtr(1).?.anim.?.state = .stopped;
+    try testing.expect(s.nextAnimationDeadline() != null);
+}
